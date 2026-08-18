@@ -11,6 +11,10 @@ CONFIG_PATH = Path("config.json")
 PROFILE_DIR = Path("browser_profile").resolve()
 
 
+class CloudflareBlockException(Exception):
+    pass
+
+
 def load_config():
     if not CONFIG_PATH.exists():
         raise FileNotFoundError(f"Configuration file {CONFIG_PATH} not found.")
@@ -49,28 +53,65 @@ def sync_cookies_from_context(context, config):
         save_config(config)
 
 
-def ensure_cloudflare_passed(page, context, config):
-    first_notice = True
-    while True:
-        title = page.title()
-        is_cf = (
-            "Just a moment" in title
-            or page.locator(
-                "#challenge-running, #challenge-stage, .cf-turnstile"
-            ).is_visible()
-        )
-        if not is_cf:
-            if not first_notice:
-                print("\n[✓] Cloudflare verification cleared! Resuming automation...")
-                sync_cookies_from_context(context, config)
+def is_cloudflare_active(page):
+    try:
+        title = page.title().lower()
+        if any(
+            t in title
+            for t in (
+                "just a moment",
+                "security verification",
+                "attention required",
+                "cloudflare",
+            )
+        ):
             return True
+        for sel in (
+            "#challenge-running",
+            "#challenge-stage",
+            ".cf-turnstile",
+            "iframe[src*='cloudflare']",
+            "iframe[src*='challenges']",
+        ):
+            if page.locator(sel).first.is_visible():
+                return True
+    except Exception:
+        pass
+    return False
 
-        if first_notice:
-            print("\n[!] Cloudflare verification detected in browser.")
-            print("[*] Waiting for verification (browser will stay open)...")
-            first_notice = False
 
-        page.wait_for_timeout(3000)
+def create_browser_context(playwright_instance, config):
+    context = playwright_instance.chromium.launch_persistent_context(
+        user_data_dir=str(PROFILE_DIR),
+        channel="chrome",
+        headless=False,
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-infobars",
+        ],
+        ignore_default_args=["--enable-automation"],
+        viewport={"width": 1280, "height": 900},
+    )
+
+    page = context.pages[0] if context.pages else context.new_page()
+    page.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', {
+            get: () => undefined
+        });
+    """)
+
+    def handle_popup(new_page):
+        if new_page != page:
+            try:
+                new_page.close()
+                page.bring_to_front()
+            except Exception:
+                pass
+
+    context.on("page", handle_popup)
+    context.add_cookies(config.get("cookies", []))
+    return context, page
 
 
 def parse_chapter_number(filename: str):
@@ -160,13 +201,22 @@ def upload_single_chapter(
     )
 
     page.goto(url, wait_until="domcontentloaded", timeout=60000)
-    ensure_cloudflare_passed(page, context, config)
     page.wait_for_timeout(1000)
 
-    page.wait_for_selector(".upage-field input", timeout=30000)
-    page.wait_for_timeout(1000)
+    if is_cloudflare_active(page):
+        raise CloudflareBlockException("Cloudflare challenge screen is active.")
 
-    # Bait any initial click-jacking/popunder triggers
+    try:
+        page.wait_for_selector(".upage-field input", timeout=15000)
+    except Exception as ex:
+        if is_cloudflare_active(page):
+            raise CloudflareBlockException(
+                "Cloudflare challenge blocked the upload form."
+            ) from ex
+        raise
+
+    page.wait_for_timeout(500)
+
     try:
         page.locator("body").click(position={"x": 5, "y": 5}, force=True, timeout=2000)
         page.wait_for_timeout(1000)
@@ -264,13 +314,20 @@ def upload_single_chapter(
     upload_tracker = {
         "finalized": False,
         "error": None,
+        "cf_blocked": False,
         "last_activity": time.time(),
         "chunks_done": 0,
     }
 
     def on_response(res):
         res_url = res.url
-        if "/upload/chunk" in res_url and res.status == 200:
+        if res.status in (403, 503) and (
+            "challenge" in res.headers.get("cf-mitigated", "").lower()
+            or "cloudflare" in res.headers.get("server", "").lower()
+        ):
+            upload_tracker["cf_blocked"] = True
+            upload_tracker["error"] = "Cloudflare blocked request (HTTP 403/503)"
+        elif "/upload/chunk" in res_url and res.status == 200:
             upload_tracker["last_activity"] = time.time()
             upload_tracker["chunks_done"] += 1
             print(
@@ -295,6 +352,9 @@ def upload_single_chapter(
     upload_tracker["last_activity"] = time.time()
 
     while True:
+        if upload_tracker.get("cf_blocked") or is_cloudflare_active(page):
+            raise CloudflareBlockException("Cloudflare challenge triggered mid-upload.")
+
         if upload_tracker["error"]:
             print(f"\n[!] Server error: {upload_tracker['error']}")
             return False, upload_tracker["error"]
@@ -315,6 +375,10 @@ def upload_single_chapter(
             return False, err_text
 
         if time.time() - upload_tracker["last_activity"] > idle_timeout:
+            if is_cloudflare_active(page):
+                raise CloudflareBlockException(
+                    "Cloudflare challenge stalled the upload."
+                )
             err_msg = f"Upload stalled: No chunk progress for {idle_timeout}s."
             print(f"\n[!] {err_msg}")
             return False, err_msg
@@ -329,37 +393,8 @@ def refresh_clearance_interactive(config):
     print("Opening real Google Chrome... Please pass Cloudflare or log in if prompted.")
 
     with sync_playwright() as p:
-        context = p.chromium.launch_persistent_context(
-            user_data_dir=str(PROFILE_DIR),
-            channel="chrome",
-            headless=False,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-infobars",
-            ],
-            ignore_default_args=["--enable-automation"],
-            viewport={"width": 1280, "height": 900},
-        )
+        context, page = create_browser_context(p, config)
 
-        page = context.pages[0] if context.pages else context.new_page()
-        page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {
-                get: () => undefined
-            });
-        """)
-
-        def handle_popup(new_page):
-            if new_page != page:
-                try:
-                    new_page.close()
-                    page.bring_to_front()
-                except Exception:
-                    pass
-
-        context.on("page", handle_popup)
-
-        context.add_cookies(config.get("cookies", []))
         page.goto("https://comix.to", wait_until="domcontentloaded")
         print(
             "\nPress Enter in this terminal after Cloudflare is passed / login is complete..."
@@ -537,41 +572,15 @@ def main():
     print(f"\nStarting upload of {len(pending_items)} chapters with Google Chrome...")
 
     with sync_playwright() as p:
-        context = p.chromium.launch_persistent_context(
-            user_data_dir=str(PROFILE_DIR),
-            channel="chrome",
-            headless=False,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-infobars",
-            ],
-            ignore_default_args=["--enable-automation"],
-            viewport={"width": 1280, "height": 900},
-        )
+        context, page = create_browser_context(p, config)
 
-        page = context.pages[0] if context.pages else context.new_page()
-        page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {
-                get: () => undefined
-            });
-        """)
-
-        def handle_popup(new_page):
-            if new_page != page:
-                try:
-                    new_page.close()
-                    page.bring_to_front()
-                except Exception:
-                    pass
-
-        context.on("page", handle_popup)
-        context.add_cookies(config["cookies"])
-
-        for idx, (ch_num, file_path) in enumerate(pending_items, 1):
+        current_idx = 0
+        while current_idx < len(pending_items):
+            ch_num, file_path = pending_items[current_idx]
             title = title_pattern.format(ch=ch_num) if title_pattern else ""
             success = False
             last_err = None
+            cf_paused = False
 
             for attempt in range(1, max_retries + 1):
                 if attempt > 1:
@@ -596,9 +605,55 @@ def main():
                     )
                     if success:
                         break
+                except CloudflareBlockException as cf_ex:
+                    print(
+                        f"\n[!] Cloudflare challenge detected on Chapter {ch_num}: {cf_ex}"
+                    )
+                    cf_paused = True
+                    break
                 except Exception as ex:
                     last_err = str(ex)
+                    if is_cloudflare_active(page):
+                        print(
+                            f"\n[!] Cloudflare challenge detected during Chapter {ch_num} error handling."
+                        )
+                        cf_paused = True
+                        break
                     print(f"[!] Exception during upload of Chapter {ch_num}: {ex}")
+
+            if cf_paused:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+
+                print("\n" + "=" * 60)
+                print("  [!] CLOUDFLARE CLEARANCE EXPIRED / CHALLENGE DETECTED")
+                print("=" * 60)
+                print(f"Uploading has been PAUSED on Chapter {ch_num}.")
+                print("No chapters were skipped and no failure was logged.")
+                print("\nOptions to continue:")
+                print("  [1] Press Enter after updating 'cf_clearance' in config.json")
+                print(
+                    "  [2] Type 'r' and press Enter to open browser & refresh automatically"
+                )
+
+                user_cf_action = (
+                    input("\nChoose an option [1/2 or press Enter for 1]: ")
+                    .strip()
+                    .lower()
+                )
+                if user_cf_action in ("2", "r", "refresh"):
+                    refresh_clearance_interactive(config)
+
+                config = load_config()
+                print(
+                    "\n[✓] Reloaded configuration. Resuming Chapter",
+                    ch_num,
+                    "upload...",
+                )
+                context, page = create_browser_context(p, config)
+                continue
 
             if success:
                 history.add(str(ch_num))
@@ -607,7 +662,7 @@ def main():
                 if str(ch_num) in failed_history:
                     del failed_history[str(ch_num)]
                     save_failed(failed_file, failed_history)
-                if idx < len(pending_items):
+                if current_idx < len(pending_items) - 1:
                     print(f"[*] Waiting {delay}s before next chapter...")
                     time.sleep(delay)
             else:
@@ -618,7 +673,12 @@ def main():
                 save_failed(failed_file, failed_history)
                 session_failed.append((ch_num, file_path.name, last_err))
 
-        context.close()
+            current_idx += 1
+
+        try:
+            context.close()
+        except Exception:
+            pass
 
     print("\n" + "=" * 50)
     print("               UPLOAD RUN SUMMARY")
