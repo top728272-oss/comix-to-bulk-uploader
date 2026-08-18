@@ -55,26 +55,16 @@ def sync_cookies_from_context(context, config):
 
 def is_cloudflare_active(page):
     try:
-        title = page.title().lower()
-        if any(
-            t in title
-            for t in (
-                "just a moment",
-                "security verification",
-                "attention required",
-                "cloudflare",
-            )
+        title = page.title().strip().lower()
+        if (
+            title.startswith("just a moment")
+            or "attention required! | cloudflare" in title
         ):
             return True
-        for sel in (
-            "#challenge-running",
-            "#challenge-stage",
-            ".cf-turnstile",
-            "iframe[src*='cloudflare']",
-            "iframe[src*='challenges']",
-        ):
-            if page.locator(sel).first.is_visible():
-                return True
+        if page.locator(
+            "#challenge-stage, #challenge-running, div#cf-wrapper"
+        ).first.is_visible():
+            return True
     except Exception:
         pass
     return False
@@ -321,13 +311,7 @@ def upload_single_chapter(
 
     def on_response(res):
         res_url = res.url
-        if res.status in (403, 503) and (
-            "challenge" in res.headers.get("cf-mitigated", "").lower()
-            or "cloudflare" in res.headers.get("server", "").lower()
-        ):
-            upload_tracker["cf_blocked"] = True
-            upload_tracker["error"] = "Cloudflare blocked request (HTTP 403/503)"
-        elif "/upload/chunk" in res_url and res.status == 200:
+        if "/upload/chunk" in res_url and res.status == 200:
             upload_tracker["last_activity"] = time.time()
             upload_tracker["chunks_done"] += 1
             print(
@@ -339,6 +323,11 @@ def upload_single_chapter(
             upload_tracker["last_activity"] = time.time()
             if "finalize" in res_url and res.status == 200:
                 upload_tracker["finalized"] = True
+            elif res.status in (403, 503):
+                upload_tracker["cf_blocked"] = True
+                upload_tracker["error"] = (
+                    f"Cloudflare blocked upload API (HTTP {res.status})"
+                )
             elif res.status in (429, 500, 502, 503, 504):
                 upload_tracker["error"] = f"HTTP {res.status} on {res_url}"
 
@@ -352,19 +341,24 @@ def upload_single_chapter(
     upload_tracker["last_activity"] = time.time()
 
     while True:
-        if upload_tracker.get("cf_blocked") or is_cloudflare_active(page):
-            raise CloudflareBlockException("Cloudflare challenge triggered mid-upload.")
-
-        if upload_tracker["error"]:
-            print(f"\n[!] Server error: {upload_tracker['error']}")
-            return False, upload_tracker["error"]
-
-        if "/user/upload/" not in page.url or upload_tracker["finalized"]:
+        if upload_tracker["finalized"] or "/user/upload/" not in page.url:
             chunks = upload_tracker["chunks_done"]
             print(
                 f"\n[✓] Chapter {chapter_num} uploaded successfully! ({chunks} chunks completed)"
             )
             return True, None
+
+        if upload_tracker.get("cf_blocked"):
+            raise CloudflareBlockException(
+                "Cloudflare challenge triggered on upload API."
+            )
+
+        if is_cloudflare_active(page):
+            raise CloudflareBlockException("Cloudflare challenge triggered mid-upload.")
+
+        if upload_tracker["error"]:
+            print(f"\n[!] Server error: {upload_tracker['error']}")
+            return False, upload_tracker["error"]
 
         error_el = page.locator(
             ".alert-danger, .error-message, .toast-error, div[role='alert']"
