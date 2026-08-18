@@ -1,0 +1,24 @@
+{
+  "user_agent": "YOUR_USER_AGENT",
+  "cookies": [
+    {
+      "name": "remember_web_<YOUR_HASHED_ID>",
+      "value": "YOUR_REMEMBER_ME_COOKIE",
+      "url": "https://comix.to"
+    },
+    {
+      "name": "session",
+      "value": "YOUR_SESSION_COOKIE",
+      "url": "https://comix.to"
+    },
+    {
+      "name": "cf_clearance",
+      "value": "YOUR_CF_CLEARANCE_COOKIE",
+      "url": "https://comix.to"
+    }
+  ],
+  "default_group": "",
+  "default_delay_seconds": 6,
+  "max_retries": 3,
+  "timeout_seconds": 180
+}

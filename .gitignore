@@ -1,0 +1,22 @@
+# Virtual environment
+.venv/
+env/
+venv/
+
+# Sensitive credentials & tokens
+config.json
+req headers.txt
+
+# Browser profile & cache
+browser_profile/
+__pycache__/
+*.pyc
+
+# Upload state & history files
+.upload_history_*.json
+.upload_failed_*.json
+
+# Artifacts & screenshots
+*.png
+*.html
+*.log
