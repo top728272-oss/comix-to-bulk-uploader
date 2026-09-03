@@ -153,11 +153,21 @@ def generate_safe_renamed_path(original_path: Path, new_num: float) -> Path:
     suffix = original_path.suffix
     num_repr = f"{new_num:g}"
 
-    match = re.search(r"(\d+(\.\d+)?)", stem)
+    cleaned_stem = re.sub(
+        r"\s*\(\d+\)$|\s*-\s*copy(\s*\(\d+\))?$|[_\s]+copy\b.*$|[_\s]+(part|pt)[_\s]*\d+$",
+        "",
+        stem,
+        flags=re.IGNORECASE,
+    ).strip()
+    cleaned_stem = re.sub(r"[_-]\d+$", "", cleaned_stem).strip()
+
+    match = re.search(r"(\d+(\.\d+)?)", cleaned_stem)
     if match:
-        new_stem = stem[: match.start(1)] + num_repr + stem[match.end(1) :]
+        new_stem = (
+            cleaned_stem[: match.start(1)] + num_repr + cleaned_stem[match.end(1) :]
+        )
     else:
-        new_stem = f"{stem}_{num_repr}"
+        new_stem = num_repr
 
     target_path = parent / f"{new_stem}{suffix}"
     if not target_path.exists() or target_path == original_path:
