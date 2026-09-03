@@ -104,6 +104,13 @@ def create_browser_context(playwright_instance, config):
     return context, page
 
 
+def natural_sort_key(s: str):
+    return [
+        int(text) if text.isdigit() else text.lower()
+        for text in re.split(r"(\d+)", str(s))
+    ]
+
+
 def parse_chapter_number(filename: str):
     base = Path(filename).stem
     match = re.search(r"(\d+(\.\d+)?)", base)
@@ -113,6 +120,121 @@ def parse_chapter_number(filename: str):
     if "." in num_str:
         return float(num_str) if not num_str.endswith(".0") else int(float(num_str))
     return int(num_str)
+
+
+def generate_next_safe_chapter_number(
+    base_num: float, used_numbers: set
+) -> float | int:
+    base_int = int(float(base_num))
+    if isinstance(base_num, int) or float(base_num).is_integer():
+        candidate = base_int + 0.5
+    else:
+        if round(float(base_num) + 0.1, 4) >= base_int + 1.0:
+            candidate = round(float(base_num) + 0.01, 4)
+        else:
+            candidate = round(float(base_num) + 0.1, 4)
+
+    step = 0.1 if candidate < base_int + 0.9 else 0.01
+    while candidate in used_numbers:
+        next_cand = round(candidate + step, 4)
+        if next_cand >= base_int + 1.0:
+            step = 0.001 if step == 0.01 else 0.01
+            next_cand = round(candidate + step, 4)
+        candidate = next_cand
+
+    if float(candidate).is_integer():
+        return int(candidate)
+    return round(candidate, 4)
+
+
+def generate_safe_renamed_path(original_path: Path, new_num: float) -> Path:
+    parent = original_path.parent
+    stem = original_path.stem
+    suffix = original_path.suffix
+    num_repr = f"{new_num:g}"
+
+    match = re.search(r"(\d+(\.\d+)?)", stem)
+    if match:
+        new_stem = stem[: match.start(1)] + num_repr + stem[match.end(1) :]
+    else:
+        new_stem = f"{stem}_{num_repr}"
+
+    target_path = parent / f"{new_stem}{suffix}"
+    if not target_path.exists() or target_path == original_path:
+        return target_path
+
+    direct_target = parent / f"{num_repr}{suffix}"
+    if not direct_target.exists():
+        return direct_target
+
+    idx = 1
+    while (parent / f"{new_stem}_{idx}{suffix}").exists():
+        idx += 1
+    return parent / f"{new_stem}_{idx}{suffix}"
+
+
+def chapter_file_sort_key(file_path: Path):
+    name = file_path.name
+    try:
+        ch_num = parse_chapter_number(name)
+    except ValueError:
+        return (float("inf"), 1, float("inf"), natural_sort_key(name))
+
+    stem = file_path.stem.strip()
+    num_str = f"{ch_num:g}"
+    is_clean = bool(
+        re.fullmatch(
+            rf"(chapter\s*|ch\.?\s*|v\d+\s*ch\.?\s*)?0*{re.escape(num_str)}",
+            stem,
+            re.IGNORECASE,
+        )
+    )
+    clean_priority = 0 if is_clean else 1
+    return (ch_num, clean_priority, len(stem), natural_sort_key(name))
+
+
+def resolve_duplicate_chapters(files: list[Path]) -> list[tuple[float | int, Path]]:
+    parsed_files = []
+    initial_numbers = set()
+
+    for f in sorted(files, key=chapter_file_sort_key):
+        try:
+            ch_num = parse_chapter_number(f.name)
+            parsed_files.append((ch_num, f))
+            initial_numbers.add(ch_num)
+        except ValueError:
+            print(f"[!] Skipping unrecognized file: {f.name}")
+
+    chapter_items = []
+    used_numbers = set()
+
+    for orig_ch, f_path in parsed_files:
+        if orig_ch not in used_numbers:
+            used_numbers.add(orig_ch)
+            chapter_items.append((orig_ch, f_path))
+        else:
+            all_reserved = used_numbers | initial_numbers
+            new_ch = generate_next_safe_chapter_number(orig_ch, all_reserved)
+            used_numbers.add(new_ch)
+
+            new_path = generate_safe_renamed_path(f_path, new_ch)
+            if new_path != f_path:
+                try:
+                    f_path.rename(new_path)
+                    print(
+                        f"[!] Duplicate chapter {orig_ch:g} detected: '{f_path.name}' -> renamed to '{new_path.name}' (Chapter {new_ch:g})"
+                    )
+                    chapter_items.append((new_ch, new_path))
+                except Exception as ex:
+                    print(
+                        f"[!] Could not rename '{f_path.name}' to '{new_path.name}': {ex}. Using original file."
+                    )
+                    chapter_items.append((new_ch, f_path))
+            else:
+                chapter_items.append((new_ch, f_path))
+
+    chapter_items.sort(key=lambda x: x[0])
+    return chapter_items
 
 
 def get_history_file(url: str):
@@ -458,15 +580,7 @@ def main():
         if f.is_file() and f.suffix.lower() in archive_exts
     ]
 
-    chapter_items = []
-    for f in files:
-        try:
-            ch_num = parse_chapter_number(f.name)
-            chapter_items.append((ch_num, f))
-        except ValueError:
-            print(f"[!] Skipping unrecognized file: {f.name}")
-
-    chapter_items.sort(key=lambda x: x[0])
+    chapter_items = resolve_duplicate_chapters(files)
 
     if start_ch is not None:
         chapter_items = [item for item in chapter_items if item[0] >= start_ch]
