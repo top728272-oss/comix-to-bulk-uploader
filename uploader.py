@@ -147,42 +147,6 @@ def generate_next_safe_chapter_number(
     return round(candidate, 4)
 
 
-def generate_safe_renamed_path(original_path: Path, new_num: float) -> Path:
-    parent = original_path.parent
-    stem = original_path.stem
-    suffix = original_path.suffix
-    num_repr = f"{new_num:g}"
-
-    cleaned_stem = re.sub(
-        r"\s*\(\d+\)$|\s*-\s*copy(\s*\(\d+\))?$|[_\s]+copy\b.*$|[_\s]+(part|pt)[_\s]*\d+$",
-        "",
-        stem,
-        flags=re.IGNORECASE,
-    ).strip()
-    cleaned_stem = re.sub(r"[_-]\d+$", "", cleaned_stem).strip()
-
-    match = re.search(r"(\d+(\.\d+)?)", cleaned_stem)
-    if match:
-        new_stem = (
-            cleaned_stem[: match.start(1)] + num_repr + cleaned_stem[match.end(1) :]
-        )
-    else:
-        new_stem = num_repr
-
-    target_path = parent / f"{new_stem}{suffix}"
-    if not target_path.exists() or target_path == original_path:
-        return target_path
-
-    direct_target = parent / f"{num_repr}{suffix}"
-    if not direct_target.exists():
-        return direct_target
-
-    idx = 1
-    while (parent / f"{new_stem}_{idx}{suffix}").exists():
-        idx += 1
-    return parent / f"{new_stem}_{idx}{suffix}"
-
-
 def chapter_file_sort_key(file_path: Path):
     name = file_path.name
     try:
@@ -226,22 +190,10 @@ def resolve_duplicate_chapters(files: list[Path]) -> list[tuple[float | int, Pat
             all_reserved = used_numbers | initial_numbers
             new_ch = generate_next_safe_chapter_number(orig_ch, all_reserved)
             used_numbers.add(new_ch)
-
-            new_path = generate_safe_renamed_path(f_path, new_ch)
-            if new_path != f_path:
-                try:
-                    f_path.rename(new_path)
-                    print(
-                        f"[!] Duplicate chapter {orig_ch:g} detected: '{f_path.name}' -> renamed to '{new_path.name}' (Chapter {new_ch:g})"
-                    )
-                    chapter_items.append((new_ch, new_path))
-                except Exception as ex:
-                    print(
-                        f"[!] Could not rename '{f_path.name}' to '{new_path.name}': {ex}. Using original file."
-                    )
-                    chapter_items.append((new_ch, f_path))
-            else:
-                chapter_items.append((new_ch, f_path))
+            print(
+                f"[!] Duplicate chapter {orig_ch:g} detected: '{f_path.name}' -> uploading as Chapter {new_ch:g}"
+            )
+            chapter_items.append((new_ch, f_path))
 
     chapter_items.sort(key=lambda x: x[0])
     return chapter_items
