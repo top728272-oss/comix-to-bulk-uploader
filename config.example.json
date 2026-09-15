@@ -20,5 +20,10 @@
   "default_group": "",
   "default_delay_seconds": 6,
   "max_retries": 3,
-  "timeout_seconds": 180
+  "timeout_seconds": 180,
+  "waf": {
+    "max_wait_seconds": 600,
+    "poll_interval_seconds": 2,
+    "max_pauses_per_chapter": 5
+  }
 }

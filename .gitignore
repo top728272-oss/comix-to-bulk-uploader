@@ -15,8 +15,16 @@ __pycache__/
 # Upload state & history files
 .upload_history_*.json
 .upload_failed_*.json
+series_library.json
 
 # Artifacts & screenshots
 *.png
 *.html
 *.log
+
+# WAF challenge debug dumps & HAR captures
+.waf_debug/
+*.har
+
+# Tooling cache
+.ruff_cache/
