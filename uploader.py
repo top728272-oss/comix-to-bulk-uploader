@@ -201,11 +201,11 @@ def main() -> None:
 
         def on_cloudflare(ch_num):
             print("\n" + "=" * 60)
-            print("  [!] CLOUDFLARE CLEARANCE EXPIRED / CHALLENGE DETECTED")
+            print("  [!] CLOUDFLARE CHALLENGE DETECTED")
             print("=" * 60)
             print(f"Paused on chapter {ch_num}. Nothing was skipped or marked failed.")
-            print("Pass Cloudflare in the Chrome window, then press Enter here.")
-            input()
+            print("comix's Cloudflare check usually clears by itself — the run")
+            print("resumes on its own. Keep this terminal open.")
 
         def on_waf(ch_num):
             # No input() here: the engine polls the tab itself and carries on
@@ -217,6 +217,29 @@ def main() -> None:
             print("In the Chrome window, drag the circle until the picture lines")
             print("up, then press Verify. Uploading resumes on its own.")
 
+        def cf_resolved(restart: bool):
+            # The engine calls this after a Cloudflare wait: restart=True means
+            # its first wait window expired, so relaunch Chrome once and let it
+            # re-run the check from scratch.
+            nonlocal context, page
+            if restart:
+                try:
+                    sync_cookies_from_context(context, config.data)
+                    context.close()
+                except Exception:
+                    pass
+                context, page = launch_context(p, config.data)
+                return page
+            try:
+                sync_cookies_from_context(context, config.data)
+            except Exception:
+                pass
+            return page
+
+        def on_challenge_cleared(kind, ch_num):
+            label = "Cloudflare" if kind == "cloudflare" else "Security check"
+            print(f"[✓] {label} cleared on chapter {ch_num:g}. Resuming...")
+
         try:
             summary = run_upload_batch(
                 page=page,
@@ -224,9 +247,10 @@ def main() -> None:
                 params=params,
                 control=control,
                 on_cloudflare=on_cloudflare,
-                cf_resolved_hook=lambda restart: page,
+                cf_resolved_hook=cf_resolved,
                 on_waf=on_waf,
                 waf_resolved_hook=lambda: page,
+                on_challenge_cleared=on_challenge_cleared,
                 max_retries=config.max_retries,
             )
         except KeyboardInterrupt:

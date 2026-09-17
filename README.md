@@ -55,18 +55,18 @@ Double-click **`Comix Uploader.bat`**, or run:
 
 ### What it does for you
 
-| Feature                     | Notes                                                                                                                                                                                                                                      |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Site search**             | Type a title, hit Search — results come straight from comix.to with chapter counts and ratings. Double-click one and the upload URL is filled in.                                                                                          |
-| **Saved series**            | Every series you use is remembered (name + ID). Next time: double-click, done. No pasting.                                                                                                                                                 |
-| **Add by ID / URL**         | Paste a series ID, `/title/...` or `/user/upload/...` URL once — it gets resolved and saved.                                                                                                                                               |
-| **Recent folders**          | Folder picker remembers the last 15 folders you used.                                                                                                                                                                                      |
-| **Per-series settings**     | Group, title pattern, official flag and delay are saved per series and restored when you pick it again.                                                                                                                                    |
-| **Chapter table**           | Shows pending / already uploaded / failed per chapter, with checkboxes so you can upload just a few.                                                                                                                                       |
-| **Pause / Stop**            | Stop lands after the current chapter; nothing is lost.                                                                                                                                                                                     |
-| **Cloudflare hand-off**     | When a challenge hits, the app pauses, shows a banner, and waits. Solve it in the Chrome window, press **"I passed it — resume"** (or **"Restart browser & resume"**). The chapter is retried — never skipped, never marked failed.        |
-| **Security check hand-off** | comix's own rotate-the-circle captcha (`/@waf/`). The app pauses, shows a banner, and **polls the tab itself** — drag the circle until the picture lines up and press Verify; uploading resumes automatically with no button press needed. |
-| **Refresh Cloudflare**      | One button restarts the browser session and re-saves cookies to `config.json`.                                                                                                                                                             |
+| Feature                     | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Site search**             | Type a title, hit Search — results come straight from comix.to with chapter counts and ratings. Double-click one and the upload URL is filled in.                                                                                                                                                                                                                                                                                                   |
+| **Saved series**            | Every series you use is remembered (name + ID). Next time: double-click, done. No pasting.                                                                                                                                                                                                                                                                                                                                                          |
+| **Add by ID / URL**         | Paste a series ID, `/title/...` or `/user/upload/...` URL once — it gets resolved and saved.                                                                                                                                                                                                                                                                                                                                                        |
+| **Recent folders**          | Folder picker remembers the last 15 folders you used.                                                                                                                                                                                                                                                                                                                                                                                               |
+| **Per-series settings**     | Group, title pattern, official flag and delay are saved per series and restored when you pick it again.                                                                                                                                                                                                                                                                                                                                             |
+| **Chapter table**           | Shows pending / already uploaded / failed per chapter, with checkboxes so you can upload just a few.                                                                                                                                                                                                                                                                                                                                                |
+| **Pause / Stop**            | Stop lands after the current chapter; nothing is lost.                                                                                                                                                                                                                                                                                                                                                                                              |
+| **Cloudflare hand-off**     | When a challenge hits, the app pauses, shows a banner, and **polls the tabs itself** — the check usually clears on its own and uploading resumes automatically. If it sits still the app reloads it, and if a full wait window (default 10 min) passes it restarts the browser once and waits one more window. **Resume now** / **Restart browser & resume** stay as manual overrides. The chapter is retried — never skipped, never marked failed. |
+| **Security check hand-off** | comix's own rotate-the-circle captcha (`/@waf/`). The app pauses, shows a banner, and **polls the tabs itself** — drag the circle until the picture lines up and press Verify; uploading resumes automatically with no button press needed.                                                                                                                                                                                                         |
+| **Refresh Cloudflare**      | One button restarts the browser session and re-saves cookies to `config.json`.                                                                                                                                                                                                                                                                                                                                                                      |
 
 ### Typical flow
 
@@ -74,7 +74,9 @@ Double-click **`Comix Uploader.bat`**, or run:
 2. Pick the chapters folder (or accept the remembered one).
 3. Tick the chapters you want (pending ones are pre-ticked).
 4. **Start upload.**
-5. If Cloudflare pops up → solve it in Chrome → **Resume**.
+5. If Cloudflare pops up → nothing to do in most cases; it clears itself and
+   the upload resumes. If it doesn't, use the banner's **Resume now** /
+   **Restart browser & resume**.
 6. If the security check pops up → drag the circle in Chrome → press **Verify**
    → it resumes by itself.
 
@@ -86,13 +88,13 @@ Verification is still on you — the app just stops making you redo everything e
 
 comix puts two different gates in front of you, and the app tells them apart:
 
-|            | Cloudflare                                                | Security check (WAF)                                              |
-| ---------- | --------------------------------------------------------- | ----------------------------------------------------------------- |
-| Looks like | "Just a moment…" / "Attention required"                   | Dark card, _Verify you're human_, a circle you drag to rotate     |
-| Where      | `comix.to`                                                | `comix.to/@waf/challenge`                                         |
-| Fixed by   | Refreshing `cf_clearance`                                 | Solving the puzzle in the open browser                            |
-| Recovery   | **I passed it — resume**, or **Restart browser & resume** | Automatic — the app polls until the challenge page navigates away |
-| Browser    | May be relaunched                                         | Never relaunched (that would discard the puzzle)                  |
+|            | Cloudflare                                                                                                      | Security check (WAF)                                              |
+| ---------- | --------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| Looks like | "Just a moment…" / "Attention required"                                                                         | Dark card, _Verify you're human_, a circle you drag to rotate     |
+| Where      | `comix.to`                                                                                                      | `comix.to/@waf/challenge`                                         |
+| Fixed by   | Refreshing `cf_clearance`                                                                                       | Solving the puzzle in the open browser                            |
+| Recovery   | Automatic — polls every tab, reloads the check if it stalls, restarts the browser once after a full wait window | Automatic — the app polls until the challenge page navigates away |
+| Browser    | Restarted once if the check will not clear                                                                      | Never relaunched (that would discard the puzzle)                  |
 
 Both are detected on page load, before the upload form is touched, and again
 every second during an upload. A challenge that appears **mid-upload** pauses the
@@ -106,11 +108,17 @@ up on that one chapter rather than looping forever, and moves on.
 
 ```json
 "waf": {
-  "max_wait_seconds": 600,      // how long to wait for you to solve it
-  "poll_interval_seconds": 2,   // how often the tab is re-checked
+  "max_wait_seconds": 600,      // how long to wait for a gate to clear (both gates)
+  "poll_interval_seconds": 2,   // how often the tabs are re-checked
   "max_pauses_per_chapter": 5   // give up on a chapter after this many gates
 }
 ```
+
+`max_wait_seconds` applies to both gates. Cloudflare effectively gets two
+windows: when the first expires, the browser is restarted once and the app
+waits one more window before stopping the run (the pending chapter is kept,
+nothing is marked failed). The security check never gets a browser restart —
+that would throw away the puzzle mid-solve.
 
 ### When something unexpected shows up
 

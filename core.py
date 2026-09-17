@@ -10,6 +10,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
@@ -30,6 +31,10 @@ WAF_DEBUG_DIR = BASE_DIR / ".waf_debug"
 
 # Cookie names that can carry a challenge clearance worth persisting.
 CLEARANCE_COOKIE_HINTS = ("clearance", "waf", "challenge")
+
+# The WAF likes to re-challenge up to about a minute before waf_pass really
+# expires, so anything under this margin should be treated as "expect a check".
+WAF_CLEARANCE_MARGIN_SECONDS = 120
 
 
 class VerificationRequired(Exception):
@@ -119,6 +124,27 @@ def sync_cookies_from_context(context, config: dict) -> bool:
     if updated:
         save_config(config)
     return updated
+
+
+def waf_clearance_seconds_left(config: dict) -> float | None:
+    """Seconds left on the persisted waf_pass clearance, or None when unknown.
+
+    The cookie value is "<unix-expiry>.<token>": the embedded timestamp is the
+    EXPIRY, not the mint time (mint + Max-Age of 3600, confirmed from a network
+    capture — a capture also showed the WAF re-challenging ~1 min early, hence
+    the margin constant above). None means "no cookie or unreadable"; callers
+    should stay silent in that case rather than guess.
+    """
+    for cookie in config.get("cookies", []):
+        if cookie.get("name") != "waf_pass":
+            continue
+        ts_part = str(cookie.get("value", "")).split(".", 1)[0]
+        try:
+            expiry = int(ts_part)
+        except (TypeError, ValueError):
+            return None
+        return expiry - time.time()
+    return None
 
 
 class ConfigStore:
@@ -568,23 +594,101 @@ def save_challenge_evidence(
     return folder
 
 
-def wait_for_waf_clearance(
+def _live_site_pages(page) -> list | None:
+    """Return live site tabs, or None when the context cannot be observed."""
+    try:
+        pages = [p for p in page.context.pages if not p.is_closed()]
+    except Exception:
+        return None
+    try:
+        if not page.is_closed() and page not in pages:
+            pages.append(page)
+    except Exception:
+        pass
+    return [
+        p
+        for p in pages
+        if urlsplit(p.url).netloc == urlsplit(SITE_ROOT).netloc
+        and urlsplit(p.url).scheme == urlsplit(SITE_ROOT).scheme
+    ]
+
+
+def _page_ready_after_challenge(page) -> bool:
+    """True when a tab shows a real page — not about:blank, not an error dump.
+
+    Kept deliberately loose: the gate detectors above decide what counts as a
+    challenge, this only stops a blank tab or a 502 corpse from being read as
+    "the challenge is gone".
+    """
+    try:
+        if (page.url or "").strip() in ("", "about:blank"):
+            return False
+        title = page.title().strip().lower()
+        body = page.locator("body").inner_text(timeout=1000).strip().lower()
+        errors = (
+            "bad gateway",
+            "gateway time-out",
+            "gateway timeout",
+            "service unavailable",
+            "internal server error",
+        )
+        if any(marker in title or marker in body for marker in errors):
+            return False
+        return bool(body) and page.evaluate("document.readyState") in (
+            "interactive",
+            "complete",
+        )
+    except Exception:
+        return False
+
+
+def _pump_browser(page, duration: float) -> None:
+    # Sync Playwright delivers navigation events only while its dispatcher runs.
+    try:
+        pages = page.context.pages
+        target = next((p for p in pages if not p.is_closed()), None)
+        if target is not None:
+            target.wait_for_timeout(duration * 1000)
+            return
+    except Exception:
+        pass
+    time.sleep(duration)
+
+
+def wait_for_challenge_clear(
     page,
     control: Control | None = None,
+    kind: str = "waf",
     log: Callable = print,
     max_wait: int = 600,
     poll: float = 2.0,
     settle: int = 2,
+    cf_reload_after: float = 30.0,
+    cf_reload_every: float = 15.0,
 ) -> bool:
-    """Block until the rotate captcha is gone, or the wait window expires.
+    """Block until the gate is gone from every tab, or the wait window expires.
 
-    The puzzle itself is solved by a human in the visible Chrome window; all
-    this does is notice that the page navigated back and say so. ``settle``
-    consecutive clean reads are required so a mid-redirect sample (where the
-    challenge is briefly gone from a blank document) cannot end the wait early.
+    The human does the solving in the visible Chrome window; all this does is
+    notice it and say so. Polls every tab on the site, not just the tracked
+    page: the /@waf/ hijack is free to move the challenge to another tab, and
+    a clearance nobody is watching never ends the wait. A read only counts as
+    clean once every tab shows real content — a blank or 502 page is not
+    "cleared", it is just another thing to wait out. ``settle`` consecutive
+    clean reads are required so a mid-redirect sample cannot end the wait
+    early. ``kind`` also decides how pushy the wait is: "waf" never touches
+    the page (reloading would reset the puzzle), while "cloudflare" reloads
+    the check when it sits still — a stalled check never mints its clearance,
+    and the fresh visit is what produces it.
     """
+    check = is_waf_challenge if kind == "waf" else is_cloudflare_active
+    manual = None
+    if control is not None:
+        manual = control.waf_event if kind == "waf" else control.cf_event
+
     deadline = time.time() + max_wait
     clean = 0
+    challenge_since: float | None = None
+    last_reload = 0.0
 
     while time.time() < deadline:
         if control is not None:
@@ -593,23 +697,61 @@ def wait_for_waf_clearance(
             if control.pause_event.is_set():
                 time.sleep(0.25)
                 continue
-            if control.waf_event.is_set():
-                control.waf_event.clear()
+            if manual is not None and manual.is_set():
+                manual.clear()
                 log("[✓] Resuming on your confirmation.")
                 return True
 
-        if is_waf_challenge(page):
+        pages = _live_site_pages(page)
+        if pages is None:
+            # The browser went away mid-wait. Nothing to observe and nothing
+            # to reload; hold here so the retry surfaces the real problem.
             clean = 0
         else:
-            clean += 1
-            if clean >= settle:
-                return True
+            challenged = [p for p in pages if check(p)]
+            if challenged:
+                clean = 0
+                now = time.time()
+                if challenge_since is None:
+                    challenge_since = now
+                elif (
+                    kind == "cloudflare"
+                    and now - challenge_since > cf_reload_after
+                    and now - last_reload > cf_reload_every
+                ):
+                    # A Cloudflare check that just spins (or dies with a 502)
+                    # never finishes on its own; reload the stuck tab. Prefer
+                    # the tracked page so the retry lands on a live tab.
+                    target = next((p for p in challenged if p == page), challenged[0])
+                    try:
+                        log("[i] The Cloudflare check seems stuck — reloading it.")
+                        target.reload(wait_until="domcontentloaded", timeout=60000)
+                    except Exception:
+                        pass
+                    last_reload = time.time()
+                    challenge_since = time.time()
+            elif pages and all(
+                not detect_challenge(p) and _page_ready_after_challenge(p)
+                for p in pages
+            ):
+                challenge_since = None
+                clean += 1
+                if clean >= settle:
+                    return True
+            else:
+                challenge_since = None
+                clean = 0
 
         slept = 0.0
         while slept < poll:
-            if control is not None and (control.stopped or control.waf_event.is_set()):
+            if control is not None and (
+                control.stopped or (manual is not None and manual.is_set())
+            ):
                 break
-            time.sleep(0.25)
+            # Pump Playwright's dispatcher while sleeping: page.url only
+            # advances when the sync API gets processing time, so a pure
+            # sleep would keep reading the pre-redirect URL forever.
+            _pump_browser(page, 0.25)
             slept += 0.25
 
     return False
@@ -1045,6 +1187,7 @@ def run_upload_batch(
     cf_resolved_hook=None,  # (restart_requested) -> page  (lets the caller relaunch)
     on_waf=None,  # (chapter_num) -> called when the WAF pause begins
     waf_resolved_hook=None,  # () -> page  (re-sync only; never relaunch)
+    on_challenge_cleared=None,  # (kind, chapter_num) -> a gate cleared itself
     max_retries: int = 3,
     idle_timeout: int = 90,
 ) -> RunSummary:
@@ -1174,7 +1317,12 @@ def run_upload_batch(
             elif challenge_kind == "waf":
                 # comix's own captcha: the user drags the circle in the Chrome
                 # window we already have open, so the context must stay alive —
-                # relaunching it would throw the puzzle away.
+                # relaunching it would throw the puzzle away. A leftover
+                # confirmation click (this run or an earlier pause) must not
+                # end the wait before the puzzle is solved, and a click that
+                # races ahead of this pause must not be discarded — so the
+                # event is cleared before the pause is announced.
+                control.waf_event.clear()
                 if on_status:
                     on_status(ch_num, "waf", "solve the security check")
                 if on_waf:
@@ -1196,8 +1344,13 @@ def run_upload_batch(
                     + "\nthen press Verify. Uploading resumes on its own."
                     + (f"\nEvidence saved to {evidence}" if evidence else "")
                 )
-                cleared = wait_for_waf_clearance(
-                    page, control=control, log=log, max_wait=waf_max_wait, poll=waf_poll
+                cleared = wait_for_challenge_clear(
+                    page,
+                    control=control,
+                    kind="waf",
+                    log=log,
+                    max_wait=waf_max_wait,
+                    poll=waf_poll,
                 )
                 if control.stopped:
                     if on_status:
@@ -1217,28 +1370,116 @@ def run_upload_batch(
                         page = waf_resolved_hook() or page
                     except Exception as ex:
                         log(f"[!] Could not re-sync the browser session: {ex}")
+                        if on_status:
+                            on_status(ch_num, "pending", "")
+                        break
                 log(f"[✓] Security check cleared. Resuming chapter {ch_num:g}.")
+                if on_challenge_cleared is not None:
+                    try:
+                        on_challenge_cleared("waf", ch_num)
+                    except Exception as ex:
+                        log(f"[!] Cleared callback failed: {ex}")
                 continue  # retry the same chapter
             else:
+                # Cloudflare: comix's check is non-interactive — a normal visit
+                # mints the clearance — so waiting it out beats waiting for a
+                # click. The resume buttons stay as manual overrides. As with
+                # the security check, the event is cleared before the pause is
+                # announced so a racing confirmation click survives.
+                control.cf_event.clear()
                 if on_status:
-                    on_status(ch_num, "cloudflare", "waiting for you")
+                    on_status(ch_num, "cloudflare", "waiting for clearance")
                 if on_cloudflare:
                     on_cloudflare(ch_num)
-                # Block until the user says Cloudflare has been dealt with.
-                control.cf_event.clear()
-                control.cf_event.wait()
+                cleared = wait_for_challenge_clear(
+                    page,
+                    control=control,
+                    kind="cloudflare",
+                    log=log,
+                    max_wait=waf_max_wait,
+                    poll=waf_poll,
+                )
                 if control.stopped:
                     if on_status:
                         on_status(ch_num, "pending", "")
+                    log("[!] Stopped by user.")
                     break
+                if not cleared:
+                    # One relaunch usually unsticks a check that will not die:
+                    # a fresh launch re-runs the check from scratch, and the
+                    # retry re-opens the upload page to trigger it. A second
+                    # full window with no clearance means something is
+                    # genuinely wrong — stop instead of spinning forever.
+                    log(
+                        "[!] Cloudflare did not clear in time. Restarting the "
+                        "browser once and waiting again..."
+                    )
+                    if cf_resolved_hook is not None:
+                        try:
+                            restarted = cf_resolved_hook(True)
+                        except Exception as ex:
+                            log(f"[!] Could not restart the browser: {ex}")
+                            if on_status:
+                                on_status(ch_num, "pending", "")
+                            break
+                        control.restart_browser = False
+                        if restarted is None:
+                            log("[!] Browser restart produced no page — stopping.")
+                            if on_status:
+                                on_status(ch_num, "pending", "")
+                            break
+                        page = restarted
+                        # Re-open the upload page so the fresh session runs the
+                        # check again; waiting on about:blank proves nothing.
+                        try:
+                            page.goto(
+                                params.url, wait_until="domcontentloaded", timeout=60000
+                            )
+                        except Exception as ex:
+                            log(f"[!] Could not re-open the upload page: {ex}")
+                            if on_status:
+                                on_status(ch_num, "pending", "")
+                            break
+                    cleared = wait_for_challenge_clear(
+                        page,
+                        control=control,
+                        kind="cloudflare",
+                        log=log,
+                        max_wait=waf_max_wait,
+                        poll=waf_poll,
+                    )
+                    if control.stopped:
+                        if on_status:
+                            on_status(ch_num, "pending", "")
+                        log("[!] Stopped by user.")
+                        break
+                    if not cleared:
+                        log(
+                            "[!] Cloudflare still did not clear after the "
+                            "restart. Stopping here so nothing is skipped or "
+                            "marked failed."
+                        )
+                        if on_status:
+                            on_status(ch_num, "pending", "")
+                        break
                 if cf_resolved_hook is not None:
                     try:
-                        page = cf_resolved_hook(bool(control.restart_browser)) or page
+                        new_page = cf_resolved_hook(bool(control.restart_browser))
                     except Exception as ex:
                         log(f"[!] Could not refresh the browser session: {ex}")
+                        if on_status:
+                            on_status(ch_num, "pending", "")
+                        break
                     finally:
                         control.restart_browser = False
-                log(f"[✓] Resuming chapter {ch_num:g}.")
+                    if new_page is not None:
+                        page = new_page
+                log(f"[✓] Cloudflare cleared. Resuming chapter {ch_num:g}.")
+                if on_challenge_cleared is not None:
+                    try:
+                        on_challenge_cleared("cloudflare", ch_num)
+                    except Exception as ex:
+                        log(f"[!] Cleared callback failed: {ex}")
                 continue  # retry the same chapter
 
         summary.processed += 1

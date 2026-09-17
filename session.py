@@ -16,6 +16,7 @@ from core import (
     ConfigStore,
     Control,
     UploadParams,
+    VerificationRequired,
     launch_context,
     resolve_series_name,
     run_upload_batch,
@@ -127,14 +128,22 @@ class BrowserSession(threading.Thread):
         if kind == "search":
             self._ensure_browser()
             query = job[1]
-            results = search_site(self.page, query, log=self._log)
+            try:
+                results = search_site(self.page, query, log=self._log)
+            except VerificationRequired as vreq:
+                self._report_blocked_job("search", vreq)
+                return
             self.emit("search_results", results)
             return
 
         if kind == "resolve":
             self._ensure_browser()
             hid = job[1]
-            name = resolve_series_name(self.page, hid, log=self._log)
+            try:
+                name = resolve_series_name(self.page, hid, log=self._log)
+            except VerificationRequired as vreq:
+                self._report_blocked_job("resolve", vreq)
+                return
             self.emit("series_name", (hid, name))
             return
 
@@ -152,6 +161,23 @@ class BrowserSession(threading.Thread):
 
     def _log(self, message: str) -> None:
         self.emit("log", str(message))
+
+    def _report_blocked_job(self, context: str, vreq: VerificationRequired) -> None:
+        """A search or name lookup ran into a verification screen.
+
+        Unlike uploads, these jobs do not wait out the challenge — the tab is
+        already sitting on it, so the user solves it in Chrome whenever they
+        like and simply retries the action afterwards.
+        """
+        what = "search" if context == "search" else "name lookup"
+        label = (
+            "Cloudflare challenge" if vreq.kind == "cloudflare" else "security check"
+        )
+        self._log(
+            f"[!] The {label} blocked the {what}. Solve it in the Chrome "
+            f"window, then retry the {what} later."
+        )
+        self.emit("job_blocked", (context, vreq.kind))
 
     def _ensure_browser(self) -> None:
         if self.context is not None:
@@ -186,7 +212,7 @@ class BrowserSession(threading.Thread):
         self.page = None
 
     def _cf_resolved(self, restart: bool):
-        """Called by the upload runner once the user clears the CF pause."""
+        """Called by the upload runner once Cloudflare has cleared."""
         if restart:
             self._close_context()
             self._ensure_browser()
@@ -195,7 +221,7 @@ class BrowserSession(threading.Thread):
         else:
             if self.context is not None:
                 sync_cookies_from_context(self.context, self.config.data)
-        return self.page
+        return self._ensure_page()
 
     def _waf_resolved(self):
         """Called once the user solves the security check.
@@ -207,6 +233,24 @@ class BrowserSession(threading.Thread):
         if self.context is not None:
             try:
                 sync_cookies_from_context(self.context, self.config.data)
+            except Exception:
+                pass
+        return self._ensure_page()
+
+    def _ensure_page(self):
+        """Keep the tracked page handle alive.
+
+        The challenge hijack is free to move the tab around (or close it); the
+        engine's retry needs a live page to navigate, not a handle to a ghost.
+        """
+        if self.context is not None:
+            try:
+                if self.page is None or self.page.is_closed():
+                    self.page = (
+                        self.context.pages[0]
+                        if self.context.pages
+                        else self.context.new_page()
+                    )
             except Exception:
                 pass
         return self.page
@@ -227,6 +271,9 @@ class BrowserSession(threading.Thread):
         def on_waf(ch):
             self.emit("waf", str(ch))
 
+        def on_challenge_cleared(kind, ch):
+            self.emit("challenge_cleared", (kind, str(ch)))
+
         try:
             summary = run_upload_batch(
                 page=self.page,
@@ -240,6 +287,7 @@ class BrowserSession(threading.Thread):
                 cf_resolved_hook=self._cf_resolved,
                 on_waf=on_waf,
                 waf_resolved_hook=self._waf_resolved,
+                on_challenge_cleared=on_challenge_cleared,
                 max_retries=self.config.max_retries,
             )
             self.emit("summary", summary)
