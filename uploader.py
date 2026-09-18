@@ -15,6 +15,7 @@ from core import (
     ConfigStore,
     Control,
     UploadParams,
+    focus_challenge_window,
     get_failed_file,
     get_history_file,
     launch_context,
@@ -47,6 +48,8 @@ def refresh_clearance_interactive(config: ConfigStore) -> None:
     with sync_playwright() as p:
         context, page = launch_context(p, config.data)
         page.goto("https://comix.to", wait_until="domcontentloaded")
+        # Explicit "come solve this" action — make sure the window is in front.
+        focus_challenge_window(page, config.data)
         print(
             "\nPress Enter in this terminal after Cloudflare is passed / login is complete..."
         )

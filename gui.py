@@ -338,6 +338,31 @@ class App(tk.Tk):
             side="left", padx=(5, 0)
         )
 
+        # Window behaviour: Chrome stays out of the way while it works, and
+        # only comes forward when a verification needs a human.
+        win = ttk.Frame(card, style="Card.TFrame")
+        win.grid(row=5, column=0, columnspan=6, sticky="ew", pady=(8, 0))
+
+        self.background_var = tk.BooleanVar(
+            value=bool(self.config_store.get("keep_window_in_background", True))
+        )
+        ttk.Checkbutton(
+            win,
+            text="Keep Chrome in the background (never steal focus)",
+            variable=self.background_var,
+            command=self._save_window_prefs,
+        ).pack(side="left", padx=(0, 14))
+
+        self.focus_challenge_var = tk.BooleanVar(
+            value=bool(self.config_store.get("focus_on_challenge", True))
+        )
+        ttk.Checkbutton(
+            win,
+            text="Focus Chrome when a verification is needed",
+            variable=self.focus_challenge_var,
+            command=self._save_window_prefs,
+        ).pack(side="left")
+
     def _build_chapters(self, parent) -> None:
         card = ttk.Frame(parent, style="Card.TFrame", padding=10)
         _attach(parent, card, weight=3)
@@ -543,6 +568,12 @@ class App(tk.Tk):
             }
         )
         save_library(self.library)
+
+    def _save_window_prefs(self) -> None:
+        self.config_store.set(
+            "keep_window_in_background", bool(self.background_var.get())
+        )
+        self.config_store.set("focus_on_challenge", bool(self.focus_challenge_var.get()))
 
     def _load_saved_series(self) -> None:
         self.saved_list.delete(0, "end")

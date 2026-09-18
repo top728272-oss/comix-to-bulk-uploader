@@ -17,6 +17,7 @@ from core import (
     Control,
     UploadParams,
     VerificationRequired,
+    focus_challenge_window,
     launch_context,
     resolve_series_name,
     run_upload_batch,
@@ -177,6 +178,9 @@ class BrowserSession(threading.Thread):
             f"[!] The {label} blocked the {what}. Solve it in the Chrome "
             f"window, then retry the {what} later."
         )
+        # Nothing else raises the window, so bring it forward here — otherwise
+        # the user is told to solve a puzzle they cannot see.
+        focus_challenge_window(self.page, self.config.data, self._log)
         self.emit("job_blocked", (context, vreq.kind))
 
     def _ensure_browser(self) -> None:
@@ -304,6 +308,9 @@ def open_browser_for_clearance(config_store: ConfigStore, log=print) -> None:
     with sync_playwright() as p:
         context, page = launch_context(p, config_store.data, headless=False)
         page.goto("https://comix.to", wait_until="domcontentloaded")
+        # This is an explicit "come solve this" action, so the window should be
+        # in front even if the profile last remembered it minimized.
+        focus_challenge_window(page, config_store.data, log)
         log("A Chrome window is open. Pass Cloudflare / log in, then continue.")
         input("Press Enter here once Cloudflare is passed...")
         sync_cookies_from_context(context, config_store.data)

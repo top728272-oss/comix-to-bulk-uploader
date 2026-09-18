@@ -442,7 +442,10 @@ def launch_context(playwright_instance, config: dict, headless: bool = False):
             if WAF_PATH in (new_page.url or ""):
                 return
             new_page.close()
-            page.bring_to_front()
+            # Closing a popup does not require raising the opener, and raising
+            # it yanks the user off whatever they were doing.
+            if not config.get("keep_window_in_background", True):
+                page.bring_to_front()
         except Exception:
             pass
 
@@ -503,6 +506,48 @@ def detect_challenge(page) -> str | None:
 
 def _kind_label(kind: str) -> str:
     return "Security check" if kind == "waf" else "Cloudflare challenge"
+
+
+# --------------------------------------------------------------------------
+# Window focus
+# --------------------------------------------------------------------------
+# The policy: routine automation never raises the Chrome window — draining a
+# queue is not a reason to steal the desktop. The one exception is a
+# verification gate, which is unsolvable without a human looking at it. These
+# helpers are that exception, and they are the only focus code left on the
+# automation path.
+
+
+def focus_challenge_window(page, config: dict | None = None, log: Callable = print) -> bool:
+    """Restore + foreground the Chrome window holding a verification gate.
+
+    Returns False when disabled, off Windows, or when the window can't be
+    found — never raises, so a focus failure cannot break a run.
+    """
+    if config is not None and not config.get("focus_on_challenge", True):
+        return False
+    if page is None:
+        return False
+    try:
+        from window_ctl import restore_and_focus_chrome
+    except Exception:
+        return False
+    try:
+        return restore_and_focus_chrome(page.context, log=log)
+    except Exception:
+        return False
+
+
+def _focus_for_challenge(page, challenged, log: Callable) -> None:
+    """Make sure the challenged tab is the visible one, then raise the window."""
+    target = next((p for p in challenged if p == page), challenged[0])
+    try:
+        # Tab-level activation (CDP), not window raising: the puzzle has to be
+        # the tab the human lands on.
+        target.bring_to_front()
+    except Exception:
+        pass
+    focus_challenge_window(target, log=log)
 
 
 def _exception_for(kind: str, message: str = "") -> VerificationRequired:
@@ -665,6 +710,7 @@ def wait_for_challenge_clear(
     settle: int = 2,
     cf_reload_after: float = 30.0,
     cf_reload_every: float = 15.0,
+    focus: bool = True,
 ) -> bool:
     """Block until the gate is gone from every tab, or the wait window expires.
 
@@ -714,6 +760,10 @@ def wait_for_challenge_clear(
                 now = time.time()
                 if challenge_since is None:
                     challenge_since = now
+                    # First sighting of this gate: surface the window so the
+                    # puzzle is actually solvable. Fires once per episode.
+                    if focus:
+                        _focus_for_challenge(page, challenged, log)
                 elif (
                     kind == "cloudflare"
                     and now - challenge_since > cf_reload_after
@@ -896,6 +946,9 @@ class Control:
     cf_event: threading.Event = field(default_factory=threading.Event)
     waf_event: threading.Event = field(default_factory=threading.Event)
     restart_browser: bool = False
+    # Off by default: draining a queue is not a reason to steal the desktop.
+    # Only a verification challenge is (see focus_challenge_window).
+    raise_window: bool = False
 
     def reset(self) -> None:
         self.stop_event.clear()
@@ -915,7 +968,9 @@ class Control:
         return self.stop_event.is_set()
 
 
-def _fill_group(page, group_name: str, log: Callable) -> None:
+def _fill_group(
+    page, group_name: str, log: Callable, allow_raise: bool = False
+) -> None:
     if not group_name:
         return
 
@@ -937,7 +992,10 @@ def _fill_group(page, group_name: str, log: Callable) -> None:
             pass
 
         try:
-            page.bring_to_front()
+            # Playwright drives the dropdown over CDP; it does not need the OS
+            # foreground, so the raise is opt-in only.
+            if allow_raise:
+                page.bring_to_front()
             page.evaluate(
                 '() => document.querySelectorAll(\'a[href="#"][target="_blank"]\')'
                 ".forEach(e => e.remove())"
@@ -1028,7 +1086,8 @@ def upload_single_chapter(
         page.wait_for_timeout(1000)
     except Exception:
         pass
-    page.bring_to_front()
+    if control is not None and control.raise_window:
+        page.bring_to_front()
 
     chapter_input = page.locator(
         ".upage-field input[placeholder*='42'], input[placeholder*='42']"
@@ -1046,7 +1105,9 @@ def upload_single_chapter(
     if title:
         title_input.fill(title)
 
-    _fill_group(page, group_name, log)
+    _fill_group(
+        page, group_name, log, allow_raise=bool(control and control.raise_window)
+    )
     check_stop()
 
     try:
@@ -1194,6 +1255,9 @@ def run_upload_batch(
     """Upload every pending chapter. Blocks until done / stopped."""
 
     control = control or Control()
+    # "keep_window_in_background" is the default; flipping it to false restores
+    # the old behaviour of raising Chrome at the start of every chapter.
+    control.raise_window = not bool(config.get("keep_window_in_background", True))
     summary = RunSummary()
 
     waf_cfg = config.get("waf") or {}
@@ -1351,6 +1415,7 @@ def run_upload_batch(
                     log=log,
                     max_wait=waf_max_wait,
                     poll=waf_poll,
+                    focus=bool(config.get("focus_on_challenge", True)),
                 )
                 if control.stopped:
                     if on_status:
@@ -1398,6 +1463,7 @@ def run_upload_batch(
                     log=log,
                     max_wait=waf_max_wait,
                     poll=waf_poll,
+                    focus=bool(config.get("focus_on_challenge", True)),
                 )
                 if control.stopped:
                     if on_status:
@@ -1447,6 +1513,7 @@ def run_upload_batch(
                         log=log,
                         max_wait=waf_max_wait,
                         poll=waf_poll,
+                        focus=bool(config.get("focus_on_challenge", True)),
                     )
                     if control.stopped:
                         if on_status:

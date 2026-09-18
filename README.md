@@ -67,6 +67,7 @@ Double-click **`Comix Uploader.bat`**, or run:
 | **Cloudflare hand-off**     | When a challenge hits, the app pauses, shows a banner, and **polls the tabs itself** — the check usually clears on its own and uploading resumes automatically. If it sits still the app reloads it, and if a full wait window (default 10 min) passes it restarts the browser once and waits one more window. **Resume now** / **Restart browser & resume** stay as manual overrides. The chapter is retried — never skipped, never marked failed. |
 | **Security check hand-off** | comix's own rotate-the-circle captcha (`/@waf/`). The app pauses, shows a banner, and **polls the tabs itself** — drag the circle until the picture lines up and press Verify; uploading resumes automatically with no button press needed.                                                                                                                                                                                                         |
 | **Refresh Cloudflare**      | One button restarts the browser session and re-saves cookies to `config.json`.                                                                                                                                                                                                                                                                                                                                                                      |
+| **Stays out of your way**   | Chrome no longer steals focus. The uploader works in the background and leaves the window wherever you put it (minimized or not). The only time it comes forward is when a Cloudflare check or security check actually needs you to look at it — and then it restores and focuses that window so the puzzle is right there. Both behaviours are toggleable in the options row.                                                                 |
 
 ### Typical flow
 
@@ -111,8 +112,22 @@ up on that one chapter rather than looping forever, and moves on.
   "max_wait_seconds": 600,      // how long to wait for a gate to clear (both gates)
   "poll_interval_seconds": 2,   // how often the tabs are re-checked
   "max_pauses_per_chapter": 5   // give up on a chapter after this many gates
-}
+},
+"keep_window_in_background": true,  // never raise Chrome during normal work
+"focus_on_challenge": true          // restore + focus Chrome when a gate appears
 ```
+
+`keep_window_in_background` is on by default: the app no longer calls
+`bring_to_front()` on any routine path, so Chrome keeps whatever state you left
+it in for the whole run. Set it to `false` only if you want to watch the
+upload happen, in which case Chrome is raised again at the start of each
+chapter.
+
+`focus_on_challenge` is the deliberate exception. The gates are unsolvable
+without a human looking at them, so when one is detected the app restores the
+window (un-minimizing it if needed) and brings it to the foreground. Once the
+gate clears the app leaves the window alone — it does not force it back down.
+Windows only; on other platforms this is a no-op.
 
 `max_wait_seconds` applies to both gates. Cloudflare effectively gets two
 windows: when the first expires, the browser is restarted once and the app

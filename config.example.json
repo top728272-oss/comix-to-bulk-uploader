@@ -21,6 +21,8 @@
   "default_delay_seconds": 6,
   "max_retries": 3,
   "timeout_seconds": 180,
+  "keep_window_in_background": true,
+  "focus_on_challenge": true,
   "waf": {
     "max_wait_seconds": 600,
     "poll_interval_seconds": 2,
