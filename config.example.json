@@ -20,6 +20,7 @@
   "default_group": "",
   "default_delay_seconds": 6,
   "max_retries": 3,
+  "concurrency": 5,
   "timeout_seconds": 180,
   "keep_window_in_background": true,
   "focus_on_challenge": true,

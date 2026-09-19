@@ -21,11 +21,12 @@ from core import (
     launch_context,
     load_failed,
     load_history,
+    read_devtools_port,
     reset_history,
-    run_upload_batch,
     scan_folder,
     sync_cookies_from_context,
 )
+from parallel import run_upload_batch_auto
 
 
 def prompt_input(prompt_text: str, default_val: str = "") -> str:
@@ -181,7 +182,9 @@ def summary_menu(params: UploadParams) -> str:
 def main() -> None:
     try:
         config = ConfigStore()
-    except FileNotFoundError as ex:
+    except (FileNotFoundError, ValueError) as ex:
+        # ValueError covers ConfigError (e.g. an out-of-range "concurrency")
+        # and malformed JSON — both must stop the run with a clear message.
         print(ex)
         sys.exit(1)
 
@@ -199,8 +202,19 @@ def main() -> None:
 
     control = Control()
 
+    enable_cdp = config.concurrency > 1
     with sync_playwright() as p:
-        context, page = launch_context(p, config.data)
+        context, page = launch_context(p, config.data, enable_cdp=enable_cdp)
+        endpoint = None
+        if enable_cdp:
+            port = read_devtools_port()
+            if port is None:
+                print(
+                    "[!] Chrome's debug port did not appear — "
+                    "running sequentially."
+                )
+            else:
+                endpoint = f"http://127.0.0.1:{port}"
 
         def on_cloudflare(ch_num):
             print("\n" + "=" * 60)
@@ -244,8 +258,9 @@ def main() -> None:
             print(f"[✓] {label} cleared on chapter {ch_num:g}. Resuming...")
 
         try:
-            summary = run_upload_batch(
+            summary = run_upload_batch_auto(
                 page=page,
+                endpoint=endpoint,
                 config=config.data,
                 params=params,
                 control=control,

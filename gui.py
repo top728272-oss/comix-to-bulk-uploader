@@ -8,11 +8,14 @@ watches the tabs and resumes on its own once a gate clears.
 
 from __future__ import annotations
 
+import sys
+import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from core import (
+    MAX_CONCURRENCY,
     WAF_CLEARANCE_MARGIN_SECONDS,
     ConfigStore,
     UploadParams,
@@ -42,6 +45,10 @@ STATUS_COLORS = {
     "cloudflare": "#b45309",
     "waf": "#b45309",
 }
+
+# Events now arrive from the session thread AND one thread per parallel
+# upload worker, so hand-offs into Tk are serialised here.
+_EMIT_LOCK = threading.Lock()
 
 
 def _attach(parent, child, weight: int = 1) -> None:
@@ -75,6 +82,10 @@ class App(tk.Tk):
         self.current_name = ""
         self.run_active = False
         self.total_queued = 0
+        # Chapters uploading right now (parallel runs have several at once).
+        self.active_chapters: set = set()
+        self.done_count = 0
+        self._run_state = "idle"
         self.search_results: list[dict] = []
         self.saved_series: list[dict] = sorted(
             self.library.get("series", []),
@@ -363,6 +374,21 @@ class App(tk.Tk):
             command=self._save_window_prefs,
         ).pack(side="left")
 
+        # How many chapters upload at once, each in its own tab of the same
+        # Chrome. 1 = one at a time (the old behaviour).
+        ttk.Label(win, text="Parallel uploads", style="Card.TLabel").pack(
+            side="left", padx=(14, 0)
+        )
+        self.concurrency_var = tk.IntVar(value=self.config_store.concurrency)
+        ttk.Spinbox(
+            win,
+            from_=1,
+            to=MAX_CONCURRENCY,
+            width=3,
+            textvariable=self.concurrency_var,
+            command=self._save_window_prefs,
+        ).pack(side="left", padx=(5, 0))
+
     def _build_chapters(self, parent) -> None:
         card = ttk.Frame(parent, style="Card.TFrame", padding=10)
         _attach(parent, card, weight=3)
@@ -518,9 +544,10 @@ class App(tk.Tk):
     # ------------------------------------------------------------- helpers
 
     def emit(self, event: str, payload=None) -> None:
-        """Thread-safe hand-off from the worker thread to the Tk main loop."""
+        """Thread-safe hand-off from the worker threads to the Tk main loop."""
         try:
-            self.after(0, lambda: self._dispatch(event, payload))
+            with _EMIT_LOCK:
+                self.after(0, lambda: self._dispatch(event, payload))
         except Exception:
             pass  # window already closed
 
@@ -574,6 +601,25 @@ class App(tk.Tk):
             "keep_window_in_background", bool(self.background_var.get())
         )
         self.config_store.set("focus_on_challenge", bool(self.focus_challenge_var.get()))
+        self._save_concurrency()
+
+    def _save_concurrency(self) -> None:
+        """Persist the spinbox value, clamped to the allowed range.
+
+        The spinbox only fires `command` on arrow clicks, so a typed value is
+        picked up when a run starts (start_upload calls this too).
+        """
+        try:
+            value = int(self.concurrency_var.get())
+        except (tk.TclError, ValueError):
+            return  # garbage in the box: keep whatever was saved before
+        value = max(1, min(MAX_CONCURRENCY, value))
+        try:
+            self.config_store.set("concurrency", value)
+        except ValueError as ex:
+            self.append_log(f"[!] {ex}")
+        if self.concurrency_var.get() != value:
+            self.concurrency_var.set(value)
 
     def _load_saved_series(self) -> None:
         self.saved_list.delete(0, "end")
@@ -939,7 +985,10 @@ class App(tk.Tk):
 
         self._persist_series_settings(folder=folder)
         self._warn_if_waf_expiring(mention_missing=True)
+        self._save_concurrency()
         self.total_queued = len(selected)
+        self.active_chapters = set()
+        self.done_count = 0
         self.progress["value"] = 0
         self.progress["maximum"] = max(1, len(selected))
         self.run_active = True
@@ -948,6 +997,11 @@ class App(tk.Tk):
         self.stop_btn.configure(state="normal")
         self.run_label.configure(text="Starting…")
         self.append_log(f"[▶] Starting: {len(selected)} chapter(s) → {url}")
+        if self.concurrency_var.get() > 1:
+            self.append_log(
+                f"[i] Up to {self.concurrency_var.get()} chapters upload at once "
+                "(one tab each)."
+            )
         self.session.submit(("start", params))
 
     def toggle_pause(self) -> None:
@@ -1078,13 +1132,41 @@ class App(tk.Tk):
         data["detail"] = detail or ""
         if status in ("done", "uploading"):
             data["selected"] = False
+        if status == "uploading":
+            self.active_chapters.add(key)
+        elif status in ("done", "failed", "pending"):
+            self.active_chapters.discard(key)
         if status == "done":
+            self.done_count += 1
             self.progress.step(1)
+        self._refresh_run_label()
         self._refresh_tree()
+
+    def _refresh_run_label(self) -> None:
+        """One label for both modes: a single chapter, or a parallel summary.
+
+        Only the "running" state is rewritten here — "Paused"/"Stopping…" are
+        the more important thing to show while they are true.
+        """
+        if self._run_state != "running":
+            return
+        active = len(self.active_chapters)
+        if active > 1:
+            self.run_label.configure(
+                text=(
+                    f"{active} uploading · "
+                    f"{self.done_count}/{self.total_queued} done"
+                )
+            )
+        elif active == 1:
+            self.run_label.configure(text="Uploading…")
 
     def _on_chunk(self, payload) -> None:
         key, count = payload
-        self.run_label.configure(text=f"Chapter {key} — {count} chunks")
+        # With several chapters in flight the single-chapter label would just
+        # flicker between them; the tree shows each row's own status instead.
+        if len(self.active_chapters) <= 1:
+            self.run_label.configure(text=f"Chapter {key} — {count} chunks")
         self.update_idletasks()
 
     def _on_cloudflare(self, chapter) -> None:
@@ -1116,6 +1198,7 @@ class App(tk.Tk):
         )
 
     def _on_run_state(self, state) -> None:
+        self._run_state = state
         if state == "running":
             self.run_label.configure(text="Uploading…")
         elif state == "paused":
@@ -1157,6 +1240,16 @@ class App(tk.Tk):
 
 
 def main() -> None:
+    # Fail fast on a bad config BEFORE any window opens: ValueError covers
+    # ConfigError (e.g. an out-of-range "concurrency") and malformed JSON.
+    try:
+        ConfigStore()
+    except (FileNotFoundError, ValueError) as ex:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("Configuration error", str(ex))
+        root.destroy()
+        sys.exit(1)
     app = App()
     app.mainloop()
 

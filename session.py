@@ -19,11 +19,12 @@ from core import (
     VerificationRequired,
     focus_challenge_window,
     launch_context,
+    read_devtools_port,
     resolve_series_name,
-    run_upload_batch,
     search_site,
     sync_cookies_from_context,
 )
+from parallel import run_upload_batch_auto
 
 
 class BrowserSession(threading.Thread):
@@ -39,6 +40,11 @@ class BrowserSession(threading.Thread):
         self.playwright = None
         self.context = None
         self.page = None
+        # Parallel uploads need the DevTools endpoint, so the browser is
+        # launched with CDP enabled whenever concurrency > 1. These track what
+        # the open browser was launched with.
+        self._cdp_on = False
+        self.cdp_endpoint: str | None = None
         self._running = True
 
     # -- public API (called from the GUI thread) ---------------------------
@@ -184,22 +190,44 @@ class BrowserSession(threading.Thread):
         self.emit("job_blocked", (context, vreq.kind))
 
     def _ensure_browser(self) -> None:
+        want_cdp = self.config.concurrency > 1
         if self.context is not None:
-            try:
-                if self.page is None or self.page.is_closed():
-                    self.page = (
-                        self.context.pages[0]
-                        if self.context.pages
-                        else self.context.new_page()
-                    )
-                return
-            except Exception:
-                self.context = None
+            if self._cdp_on == want_cdp:
+                try:
+                    if self.page is None or self.page.is_closed():
+                        self.page = (
+                            self.context.pages[0]
+                            if self.context.pages
+                            else self.context.new_page()
+                        )
+                    return
+                except Exception:
+                    self.context = None
+            else:
+                # The concurrency setting changed since this browser started
+                # (the DevTools endpoint is a launch flag), so relaunch. The
+                # profile keeps the login and the clearance cookies.
+                self._log("[i] Concurrency changed — restarting Chrome to match.")
+                self._close_context()
 
         self.emit("browser", "starting")
         self.context, self.page = launch_context(
-            self.playwright, self.config.data, headless=False
+            self.playwright,
+            self.config.data,
+            headless=False,
+            enable_cdp=want_cdp,
         )
+        self._cdp_on = want_cdp
+        self.cdp_endpoint = None
+        if want_cdp:
+            port = read_devtools_port()
+            if port is None:
+                self._log(
+                    "[!] Chrome's debug port did not appear — parallel uploads "
+                    "will fall back to sequential."
+                )
+            else:
+                self.cdp_endpoint = f"http://127.0.0.1:{port}"
         self.emit("browser", "ready")
 
     def _close_context(self) -> None:
@@ -214,6 +242,8 @@ class BrowserSession(threading.Thread):
                 pass
         self.context = None
         self.page = None
+        self._cdp_on = False
+        self.cdp_endpoint = None
 
     def _cf_resolved(self, restart: bool):
         """Called by the upload runner once Cloudflare has cleared."""
@@ -279,8 +309,9 @@ class BrowserSession(threading.Thread):
             self.emit("challenge_cleared", (kind, str(ch)))
 
         try:
-            summary = run_upload_batch(
+            summary = run_upload_batch_auto(
                 page=self.page,
+                endpoint=self.cdp_endpoint,
                 config=self.config.data,
                 params=params,
                 log=self._log,

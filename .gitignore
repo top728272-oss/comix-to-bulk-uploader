@@ -12,7 +12,8 @@ browser_profile/
 __pycache__/
 *.pyc
 
-# Upload state & history files
+# Upload state & history files (current layout + pre-.history leftovers)
+.history/
 .upload_history_*.json
 .upload_failed_*.json
 series_library.json

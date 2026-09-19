@@ -113,9 +113,27 @@ up on that one chapter rather than looping forever, and moves on.
   "poll_interval_seconds": 2,   // how often the tabs are re-checked
   "max_pauses_per_chapter": 5   // give up on a chapter after this many gates
 },
+"concurrency": 5,                   // chapters uploading at once (1-8)
 "keep_window_in_background": true,  // never raise Chrome during normal work
 "focus_on_challenge": true          // restore + focus Chrome when a gate appears
 ```
+
+`concurrency` is how many chapters upload **at the same time**, each in its own
+tab of the same Chrome window. `1` is the old strictly-one-at-a-time behaviour;
+the default is `5`. Because every tab belongs to the same browser, they share
+your login and the WAF clearance — one captcha solve still covers the whole
+batch. Values above **8** (or anything that is not a whole number) are refused
+with a clear message when the app starts, so a typo cannot quietly halve or
+double your upload rate.
+
+Parallel uploads need a local Chrome debugging endpoint; if it cannot be
+opened, the app says so and simply runs the batch sequentially — it never
+fails a run over this. Two things worth knowing when running several at once:
+the browser restart that Cloudflare recovery normally does is skipped (it would
+kill the other uploads mid-flight — the chapter is retried sequentially at the
+end instead), and the site has not been tested for parallel uploads to the
+*same* series, so if you see server-side errors, drop `concurrency` to `2` or
+`1`.
 
 `keep_window_in_background` is on by default: the app no longer calls
 `bring_to_front()` on any routine path, so Chrome keeps whatever state you left
@@ -159,8 +177,11 @@ Same engine, same history/retry behaviour, terminal prompts.
 - **Supported archives:** `.zip`, `.cbz`, `.cbr`, `.rar`, `.7z`
 - **Duplicate chapter numbers** are auto-renumbered (e.g. a second `10` becomes
   `10.5`) instead of being skipped.
-- **Upload history** lives in `.upload_history_<series-id>.json`,
-  failures in `.upload_failed_<series-id>.json`. "Reset history" clears both.
+- **Upload history** lives in `.history/` (gitignored), one file per series:
+  `upload_history_<series-id>.json` and `upload_failed_<series-id>.json`.
+  "Reset history" clears both for the current series. History files written by
+  older versions (`.upload_history_*.json` in the project root) are moved into
+  `.history/` automatically the first time the app runs.
 - **Saved series + recent folders** live in `series_library.json`.
 - **Challenge evidence dumps** land in `.waf_debug/` (screenshots, page HTML,
   `meta.json`) and are safe to delete.
@@ -170,11 +191,30 @@ Same engine, same history/retry behaviour, terminal prompts.
 
 ---
 
-## 7. Project layout
+## 7. Tests
+
+```bash
+.venv\Scripts\python.exe -m unittest discover tests
+```
+
+The suite needs no browser, no network and no Playwright account: `core.py` is
+stdlib-only by design and `parallel.py`'s browser plumbing is stubbed, so it
+runs in well under a second. It covers the config validation (including the
+"concurrency too large" error), the upload engine's control flow — success,
+failure, skip-already-uploaded, stop, gate-cleared retry, gate-expiry, the
+parallel/sequential dispatch, the file-input attach and its fallbacks — and the
+history layout including the migration of pre-`.history/` files.
+
+---
+
+## 8. Project layout
 
 ```
 core.py      shared engine: config, chapter scanning, history, uploading, site search
+parallel.py  parallel upload engine (worker tabs attached to the same Chrome)
 session.py   background browser worker (persistent Chrome + job queue)
 gui.py       Tkinter desktop app
 uploader.py  command-line interface
+window_ctl.py Windows-only helper that focuses Chrome for a verification gate
+tests/       stdlib unittest suite (no browser needed)
 ```
