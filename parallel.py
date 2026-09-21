@@ -228,6 +228,7 @@ def _run_parallel(
         """Attach, drain the chapter queue, disconnect. Own thread only."""
         rows: list = []
         pw = None
+        page = None
         try:
             pw = sync_playwright().start()
             browser = pw.chromium.connect_over_cdp(endpoint)
@@ -264,6 +265,13 @@ def _run_parallel(
         except Exception:
             rows.append((None, None, "error", traceback.format_exc()))
         finally:
+            # Disconnecting alone leaves this worker's tab behind in Chrome
+            # (usually sitting on about:blank); close it first.
+            try:
+                if page is not None and not page.is_closed():
+                    page.close()
+            except Exception:
+                pass
             if pw is not None:
                 try:
                     pw.stop()

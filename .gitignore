@@ -29,3 +29,7 @@ series_library.json
 
 # Tooling cache
 .ruff_cache/
+
+# Read-only collector (standalone, intentionally untracked)
+collect.py
+collect_out/

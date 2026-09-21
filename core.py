@@ -669,6 +669,15 @@ def install_popup_handler(context, page, config: dict) -> None:
 
     Extracted from launch_context so parallel workers can guard the pages
     they create on their own CDP connection.
+
+    A tab is only treated as a popup when it was opened BY another page
+    (``window.open`` / ``target=_blank`` — the way ads do it), i.e. it has an
+    opener. Tabs created programmatically via ``context.new_page()`` have no
+    opener. That distinction is what keeps the parallel upload workers alive:
+    every CDP connection sees every tab in the browser, so without it each
+    connection's handler would mistake the other workers' fresh ``about:blank``
+    tabs for ads and close them. The trade-off is that popups opened with
+    ``rel=noopener`` no longer get closed — rare, and harmless.
     """
 
     def handle_popup(new_page):
@@ -678,6 +687,10 @@ def install_popup_handler(context, page, config: dict) -> None:
             # The security check must be left alone — closing it would throw
             # away the puzzle the user is about to solve.
             if WAF_PATH in (new_page.url or ""):
+                return
+            # No opener => opened programmatically (a parallel worker's tab,
+            # or our own), not by the page. Never close those.
+            if new_page.opener() is None:
                 return
             new_page.close()
             # Closing a popup does not require raising the opener, and raising
