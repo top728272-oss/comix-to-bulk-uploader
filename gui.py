@@ -24,8 +24,10 @@ from core import (
     load_failed,
     load_history,
     load_library,
+    parse_chapter_mapping,
     remember_folder,
     reset_history,
+    resolve_chapter_title,
     save_library,
     scan_folder,
     series_id_from_url,
@@ -93,6 +95,11 @@ class App(tk.Tk):
             reverse=True,
         )
         self.series_panel_open = True
+        # Chapter titles imported from rename.py's chapter_mapping.txt.
+        # While a map is active it owns the titles and the pattern entry
+        # is disabled (its value still serves as the fallback for misses).
+        self.title_map: dict | None = None
+        self.title_map_name = ""
 
         self._build_style()
         self._build_ui()
@@ -316,9 +323,29 @@ class App(tk.Tk):
 
         ttk.Label(opts, text="Title", style="Card.TLabel").pack(side="left")
         self.title_var = tk.StringVar(value="Chapter {ch}")
-        ttk.Entry(opts, textvariable=self.title_var, width=16).pack(
-            side="left", padx=(5, 12)
+        self.title_entry = ttk.Entry(opts, textvariable=self.title_var, width=16)
+        self.title_entry.pack(side="left", padx=(5, 12))
+
+        # Chapter mapping import (rename.py's chapter_mapping.txt). While a
+        # map is loaded it owns the titles and the pattern entry is disabled.
+        self.map_btn = ttk.Button(
+            opts, text="Import map…", command=self.import_mapping, width=12
         )
+        self.map_btn.pack(side="left", padx=(0, 4))
+        self.map_label = ttk.Label(opts, text="", style="Sub.TLabel")
+        self.map_label.pack(side="left", padx=(0, 4))
+        self.map_clear_btn = ttk.Button(
+            opts, text="✕", command=self.clear_mapping, width=3
+        )
+        self.strip_map_var = tk.BooleanVar(value=True)
+        self.strip_map_cb = ttk.Checkbutton(
+            opts,
+            text="Strip numbering",
+            variable=self.strip_map_var,
+            command=self._on_mapping_changed,
+        )
+        self.strip_map_cb.pack(side="left", padx=(4, 12))
+        self._on_mapping_changed(persist=False)
 
         ttk.Label(opts, text="Group", style="Card.TLabel").pack(side="left")
         self.group_var = tk.StringVar()
@@ -416,18 +443,20 @@ class App(tk.Tk):
             side="right", padx=2
         )
 
-        cols = ("sel", "chapter", "file", "status")
+        cols = ("sel", "chapter", "file", "title", "status")
         self.tree = ttk.Treeview(
             card, columns=cols, show="headings", height=6, selectmode="none"
         )
         self.tree.heading("sel", text="✓")
         self.tree.heading("chapter", text="Chapter")
         self.tree.heading("file", text="File")
+        self.tree.heading("title", text="Title")
         self.tree.heading("status", text="Status")
         self.tree.column("sel", width=34, anchor="center", stretch=False)
-        self.tree.column("chapter", width=90, anchor="center", stretch=False)
-        self.tree.column("file", width=520, anchor="w")
-        self.tree.column("status", width=230, anchor="w")
+        self.tree.column("chapter", width=70, anchor="center", stretch=False)
+        self.tree.column("file", width=340, anchor="w")
+        self.tree.column("title", width=260, anchor="w")
+        self.tree.column("status", width=180, anchor="w")
         self.tree.pack(fill="both", expand=True)
         self.tree.bind("<Button-1>", self._on_tree_click)
 
@@ -576,6 +605,7 @@ class App(tk.Tk):
         self.title_var.set(defaults.get("title_pattern", "Chapter {ch}"))
         self.official_var.set(bool(defaults.get("official", False)))
         self.delay_var.set(int(defaults.get("delay", self.config_store.delay)))
+        self.strip_map_var.set(bool(defaults.get("strip_map_numbers", True)))
 
         folders = self.library.get("recent_folders", [])
         self.folder_box["values"] = folders
@@ -592,6 +622,7 @@ class App(tk.Tk):
                 "title_pattern": self.title_var.get(),
                 "official": self.official_var.get(),
                 "delay": self.delay_var.get(),
+                "strip_map_numbers": bool(self.strip_map_var.get()),
             }
         )
         save_library(self.library)
@@ -600,7 +631,9 @@ class App(tk.Tk):
         self.config_store.set(
             "keep_window_in_background", bool(self.background_var.get())
         )
-        self.config_store.set("focus_on_challenge", bool(self.focus_challenge_var.get()))
+        self.config_store.set(
+            "focus_on_challenge", bool(self.focus_challenge_var.get())
+        )
         self._save_concurrency()
 
     def _save_concurrency(self) -> None:
@@ -764,7 +797,17 @@ class App(tk.Tk):
             **{
                 k: v
                 for k, v in (restore or {}).items()
-                if k in ("folder", "group", "title_pattern", "official", "delay")
+                if k
+                in (
+                    "folder",
+                    "group",
+                    "title_pattern",
+                    "official",
+                    "delay",
+                    "title_map",
+                    "title_map_name",
+                    "strip_map_numbers",
+                )
             },
         )
         self._load_saved_series()
@@ -782,6 +825,20 @@ class App(tk.Tk):
                 self.delay_var.set(int(restore["delay"]))
         elif entry.get("folder"):
             self.folder_var.set(entry["folder"])
+
+        # The chapter mapping belongs to the series, so switching series
+        # either restores that series' map or drops the previous one.
+        source = restore if restore is not None else entry
+        mapping = source.get("title_map") if source else None
+        if mapping:
+            self.title_map = {str(k): str(v) for k, v in mapping.items()}
+            self.title_map_name = source.get("title_map_name", "chapter_mapping.txt")
+        else:
+            self.title_map = None
+            self.title_map_name = ""
+        if source and "strip_map_numbers" in source:
+            self.strip_map_var.set(bool(source["strip_map_numbers"]))
+        self._on_mapping_changed(persist=False)
 
         try:
             label = f"{name or hid}  ({hid})"
@@ -805,6 +862,70 @@ class App(tk.Tk):
         if folder:
             self.folder_var.set(folder)
             self.scan_chapters()
+
+    # -------------------------------------------------- chapter title map
+
+    def import_mapping(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Select chapter_mapping.txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            text = Path(path).read_text(encoding="utf-8-sig")
+        except OSError as ex:
+            messagebox.showerror("Import failed", f"Could not read {path}:\n{ex}")
+            return
+        mapping = parse_chapter_mapping(text)
+        if not mapping:
+            messagebox.showwarning(
+                "Empty mapping",
+                f"No 'new -> original' lines found in {Path(path).name}.",
+            )
+            return
+        self.title_map = mapping
+        self.title_map_name = Path(path).name
+        self.append_log(
+            f"[i] Chapter map loaded: {self.title_map_name} ({len(mapping)} titles)"
+        )
+        self._on_mapping_changed()
+
+    def clear_mapping(self) -> None:
+        if self.title_map is None:
+            return
+        self.title_map = None
+        self.title_map_name = ""
+        self.append_log("[i] Chapter map cleared — title pattern is back in use.")
+        self._on_mapping_changed()
+
+    def _on_mapping_changed(self, persist: bool = True) -> None:
+        active = self.title_map is not None
+        self.title_entry.configure(state="disabled" if active else "normal")
+        self.strip_map_cb.configure(state="normal" if active else "disabled")
+        if active:
+            self.map_label.configure(
+                text=f"{self.title_map_name} · {len(self.title_map)} titles"
+            )
+            if not self.map_clear_btn.winfo_manager():
+                self.map_clear_btn.pack(side="left", padx=(0, 4), after=self.map_label)
+        else:
+            self.map_label.configure(text="")
+            if self.map_clear_btn.winfo_manager():
+                self.map_clear_btn.pack_forget()
+        if hasattr(self, "tree"):
+            self._refresh_tree()
+        if persist:
+            self._persist_series_settings()
+
+    def _title_for(self, ch_num) -> str:
+        """Preview of the exact title a chapter will upload with."""
+        params = UploadParams(
+            title_pattern=self.title_var.get(),
+            title_map=self.title_map,
+            strip_map_numbers=bool(self.strip_map_var.get()),
+        )
+        return resolve_chapter_title(params, ch_num)
 
     def scan_chapters(self) -> None:
         folder = self.folder_var.get().strip().strip('"')
@@ -868,7 +989,13 @@ class App(tk.Tk):
                 "",
                 "end",
                 iid=key,
-                values=(mark, f"{data['ch']:g}", data["path"].name, status_text),
+                values=(
+                    mark,
+                    f"{data['ch']:g}",
+                    data["path"].name,
+                    self._title_for(data["ch"]),
+                    status_text,
+                ),
                 tags=(data["status"],),
             )
 
@@ -928,6 +1055,9 @@ class App(tk.Tk):
             title_pattern=self.title_var.get(),
             official=self.official_var.get(),
             delay=self.delay_var.get(),
+            title_map=self.title_map,
+            title_map_name=self.title_map_name,
+            strip_map_numbers=bool(self.strip_map_var.get()),
             **extra,
         )
         self._save_defaults()
@@ -981,6 +1111,8 @@ class App(tk.Tk):
             start=to_float(self.start_var.get()),
             end=to_float(self.end_var.get()),
             selected=selected,
+            title_map=self.title_map,
+            strip_map_numbers=bool(self.strip_map_var.get()),
         )
 
         self._persist_series_settings(folder=folder)
@@ -1154,8 +1286,7 @@ class App(tk.Tk):
         if active > 1:
             self.run_label.configure(
                 text=(
-                    f"{active} uploading · "
-                    f"{self.done_count}/{self.total_queued} done"
+                    f"{active} uploading · {self.done_count}/{self.total_queued} done"
                 )
             )
         elif active == 1:

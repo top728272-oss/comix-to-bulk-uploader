@@ -17,7 +17,7 @@ from pathlib import Path
 # through unittest discovery: the engine lives in the project root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import core  # noqa: E402
+import core
 
 
 class ConcurrencyValidationTests(unittest.TestCase):
@@ -102,7 +102,9 @@ class ConcurrencyValidationTests(unittest.TestCase):
         self._write_config({})
         store = core.ConfigStore()
         store.set("concurrency", 2)
-        self.assertEqual(json.loads(core.CONFIG_PATH.read_text("utf-8"))["concurrency"], 2)
+        self.assertEqual(
+            json.loads(core.CONFIG_PATH.read_text("utf-8"))["concurrency"], 2
+        )
         self.assertEqual(core.ConfigStore().concurrency, 2)
 
 

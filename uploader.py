@@ -21,6 +21,7 @@ from core import (
     launch_context,
     load_failed,
     load_history,
+    parse_chapter_mapping,
     read_devtools_port,
     reset_history,
     scan_folder,
@@ -78,9 +79,30 @@ def collect_params(config: ConfigStore) -> UploadParams:
             break
         print(f"[!] Directory '{target_dir}' does not exist. Please check the path.")
 
-    title_pattern = input(
-        "Enter chapter title pattern (use {ch} for number, Enter for none): "
-    ).strip()
+    # Optional: titles from rename.py's chapter_mapping.txt. When one loads,
+    # it owns the titles and the pattern prompt is skipped.
+    title_map = None
+    map_path = (
+        input("Path to chapter_mapping.txt (Enter for none): ").strip().strip('"')
+    )
+    if map_path:
+        try:
+            title_map = parse_chapter_mapping(
+                Path(map_path).read_text(encoding="utf-8-sig")
+            )
+        except OSError as ex:
+            print(f"[!] Could not read mapping file: {ex}")
+        if title_map:
+            print(f"[✓] Loaded {len(title_map)} chapter titles from mapping.")
+        else:
+            print("[!] No mapping lines found — falling back to title pattern.")
+            title_map = None
+
+    title_pattern = ""
+    if not title_map:
+        title_pattern = input(
+            "Enter chapter title pattern (use {ch} for number, Enter for none): "
+        ).strip()
 
     default_grp = config.group
     group = input(
@@ -109,6 +131,7 @@ def collect_params(config: ConfigStore) -> UploadParams:
         delay=int(delay_str) if delay_str.isdigit() else config.delay,
         start=float(start_str) if start_str else None,
         end=float(end_str) if end_str else None,
+        title_map=title_map,
     )
 
 
@@ -128,6 +151,11 @@ def summary_menu(params: UploadParams) -> str:
         print(f"  Folder           : {params.folder}")
         print(f"  Group            : {params.group or '(None / Solo)'}")
         print(f"  Title Pattern    : {params.title_pattern or '(None)'}")
+        if params.title_map:
+            print(
+                f"  Title Map        : {len(params.title_map)} titles "
+                "(overrides pattern)"
+            )
         print(f"  Total Found      : {len(items)}")
         print(f"  Already Uploaded : {len(items) - len(pending)}")
         print(f"  Failed in Past   : {len(failed)}")
@@ -209,10 +237,7 @@ def main() -> None:
         if enable_cdp:
             port = read_devtools_port()
             if port is None:
-                print(
-                    "[!] Chrome's debug port did not appear — "
-                    "running sequentially."
-                )
+                print("[!] Chrome's debug port did not appear — running sequentially.")
             else:
                 endpoint = f"http://127.0.0.1:{port}"
 

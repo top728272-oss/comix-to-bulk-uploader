@@ -37,17 +37,17 @@ from playwright.sync_api import sync_playwright
 import core
 from core import (
     DEFAULT_CONCURRENCY,
+    STEALTH_INIT_SCRIPT,
     ChapterContext,
     Control,
     HistoryRecorder,
     RunSummary,
-    STEALTH_INIT_SCRIPT,
+    _process_chapter,
     build_chapter_context,
     install_popup_handler,
     live_waf_pass_valid,
     pending_chapters,
     wait_for_challenge_clear,
-    _process_chapter,
 )
 
 # The parallel WAF wait runs in slices so it can also notice a clearance that
@@ -149,10 +149,7 @@ def _make_waf_wait(context, url: str, max_wait: int, poll: float, focus: bool):
             if control.stopped:
                 return False
             if live_waf_pass_valid(context):
-                log(
-                    "[i] Security check solved in another tab — "
-                    "re-opening this one."
-                )
+                log("[i] Security check solved in another tab — re-opening this one.")
                 try:
                     page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 except Exception as ex:
@@ -206,8 +203,16 @@ def _run_parallel(
     shared = {
         k: v
         for k, v in kwargs.items()
-        if k in ("on_status", "on_chunk", "on_cloudflare", "on_waf",
-                 "on_challenge_cleared", "max_retries", "idle_timeout")
+        if k
+        in (
+            "on_status",
+            "on_chunk",
+            "on_cloudflare",
+            "on_waf",
+            "on_challenge_cleared",
+            "max_retries",
+            "idle_timeout",
+        )
     }
 
     def make_ctx(context) -> ChapterContext:
@@ -221,7 +226,9 @@ def _run_parallel(
             recorder=recorder,
             cf_resolved_hook=None,
             waf_resolved_hook=None,
-            waf_wait_fn=_make_waf_wait(context, params.url, waf_max_wait, waf_poll, focus),
+            waf_wait_fn=_make_waf_wait(
+                context, params.url, waf_max_wait, waf_poll, focus
+            ),
         )
 
     def worker(index: int) -> list:

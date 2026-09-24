@@ -170,7 +170,9 @@ def _pid_via_process_tree() -> int | None:
 
 def _snapshot_processes() -> list[tuple[int, int, str]]:
     """[(pid, ppid, exe_name)] for every running process."""
-    ULONG_PTR = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
+    ULONG_PTR = (
+        ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
+    )
 
     class PROCESSENTRY32W(ctypes.Structure):
         _fields_ = [
@@ -191,9 +193,15 @@ def _snapshot_processes() -> list[tuple[int, int, str]]:
 
     _kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
     _kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-    _kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    _kernel32.Process32FirstW.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(PROCESSENTRY32W),
+    ]
     _kernel32.Process32FirstW.restype = wintypes.BOOL
-    _kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    _kernel32.Process32NextW.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(PROCESSENTRY32W),
+    ]
     _kernel32.Process32NextW.restype = wintypes.BOOL
 
     snap = _kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
@@ -206,7 +214,11 @@ def _snapshot_processes() -> list[tuple[int, int, str]]:
         ok = _kernel32.Process32FirstW(snap, ctypes.byref(entry))
         while ok:
             out.append(
-                (int(entry.th32ProcessID), int(entry.th32ParentProcessID), entry.szExeFile)
+                (
+                    int(entry.th32ProcessID),
+                    int(entry.th32ParentProcessID),
+                    entry.szExeFile,
+                )
             )
             entry = PROCESSENTRY32W()
             entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)

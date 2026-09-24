@@ -20,7 +20,7 @@ from pathlib import Path
 # well as through unittest discovery: the engine lives in the project root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import core  # noqa: E402
+import core
 
 
 class FakePage:

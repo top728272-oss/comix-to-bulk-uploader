@@ -371,6 +371,80 @@ def parse_chapter_number(filename: str):
     return int(num_str)
 
 
+# --------------------------------------------------------------------------
+# Chapter title mapping (rename.py's chapter_mapping.txt)
+# --------------------------------------------------------------------------
+
+_MAP_LINE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*->\s*(.+?)\s*$")
+
+# A leading folder counter, optionally followed by a chapter token:
+# "002 1话.", "15 Chapter 14 - ", "007 第3话:". Arc labels like
+# "番外-" or "Adventure Arc 03." do NOT match and are kept on purpose.
+_MAP_NUM_PREFIX = re.compile(
+    r"^\s*\d+(?:\.\d+)?\s*"
+    r"(?:"
+    r"(?:ch(?:apter)?\.?|第)?\s*\d+(?:\.\d+)?\s*话?"
+    r"[\s.\-–—:：、]*"
+    r")?",
+    re.IGNORECASE,
+)
+
+_MAP_LEADING_SEP = re.compile(r"^[\s.\-–—:：、]+")
+
+
+def parse_chapter_mapping(text: str) -> dict:
+    """Parse rename.py's chapter_mapping.txt into ``{chapter_key: raw_title}``.
+
+    Only ``new -> original`` lines are kept; the header, divider and any
+    other lines are skipped. Keys are normalized with ``f"{n:g}"`` so they
+    match scan_folder() numbers exactly — ``"2"`` and ``"002"`` both key as
+    ``"2"``, and decimals like ``117.5`` survive (this is why the number is
+    read with a regex on the raw line instead of parse_chapter_number, whose
+    ``Path.stem`` would turn a bare ``117.5`` into ``117``). When the same
+    number appears twice, the first mapping wins.
+    """
+    mapping = {}
+    for line in text.splitlines():
+        match = _MAP_LINE.match(line)
+        if not match:
+            continue
+        key = f"{float(match.group(1)):g}"
+        if key not in mapping:
+            mapping[key] = match.group(2)
+    return mapping
+
+
+def clean_mapped_title(raw: str, strip_numbers: bool = True) -> str:
+    """Turn a mapping's right-hand side into the title to upload.
+
+    With ``strip_numbers`` on (the default) the leading folder counter and
+    an optional chapter token are removed: ``"002 1话.倒霉体质"`` becomes
+    ``"倒霉体质"`` and ``"15 Chapter 14 - The Captain"`` becomes
+    ``"The Captain"``. Arc prefixes (``"番外-"``, ``"Adventure Arc 03."``)
+    are preserved because they carry real ordering information.
+    """
+    title = raw.strip()
+    if strip_numbers:
+        title = _MAP_NUM_PREFIX.sub("", title, count=1)
+        title = _MAP_LEADING_SEP.sub("", title)
+    return title.strip()
+
+
+def resolve_chapter_title(params: UploadParams, ch_num) -> str:
+    """Pick the title for one chapter: mapping hit, else pattern, else "".
+
+    Mapping keys are looked up with the same ``f"{n:g}"`` normalization the
+    parser uses, so int and float chapter numbers hit the same entry.
+    """
+    title_map = getattr(params, "title_map", None)
+    if title_map:
+        raw = title_map.get(f"{float(ch_num):g}")
+        if raw is not None:
+            return clean_mapped_title(raw, getattr(params, "strip_map_numbers", True))
+    pattern = getattr(params, "title_pattern", "") or ""
+    return pattern.format(ch=ch_num) if pattern else ""
+
+
 def generate_next_safe_chapter_number(base_num: float, used_numbers: set):
     base_int = int(float(base_num))
     if isinstance(base_num, int) or float(base_num).is_integer():
@@ -781,7 +855,9 @@ def _kind_label(kind: str) -> str:
 # automation path.
 
 
-def focus_challenge_window(page, config: dict | None = None, log: Callable = print) -> bool:
+def focus_challenge_window(
+    page, config: dict | None = None, log: Callable = print
+) -> bool:
     """Restore + foreground the Chrome window holding a verification gate.
 
     Returns False when disabled, off Windows, or when the window can't be
@@ -1212,6 +1288,10 @@ class UploadParams:
     start: float | None = None
     end: float | None = None
     selected: list | None = None  # chapter numbers to upload (None = all pending)
+    # Chapter titles from rename.py's chapter_mapping.txt. While set, map
+    # hits win over title_pattern; misses still fall back to the pattern.
+    title_map: dict | None = None
+    strip_map_numbers: bool = True
 
 
 @dataclass
@@ -1625,7 +1705,7 @@ class ChapterContext:
     log: Callable = print
     on_status: Callable | None = None
     on_chunk: Callable | None = None
-    control: "Control | None" = None
+    control: Control | None = None
     max_retries: int = 3
     idle_timeout: int = 90
     waf_max_wait: int = 600
@@ -1641,7 +1721,7 @@ class ChapterContext:
     # supplied sliced WAF wait (it also watches the live waf_pass cookie).
     allow_restart: bool = True
     waf_wait_fn: Callable | None = None
-    recorder: "HistoryRecorder | None" = None
+    recorder: HistoryRecorder | None = None
     # Deliberately on the context, not in the retry loop: the challenge path
     # re-enters that loop, which would reset per-chapter/per-run state and let
     # a hot loop spin forever.
@@ -1649,7 +1729,9 @@ class ChapterContext:
     dumped: bool = False
 
 
-def build_chapter_context(config: dict, params: UploadParams, **overrides) -> ChapterContext:
+def build_chapter_context(
+    config: dict, params: UploadParams, **overrides
+) -> ChapterContext:
     """ChapterContext from config + params, with per-run defaults applied."""
     waf_cfg = config.get("waf") or {}
     kwargs = dict(
@@ -1700,7 +1782,7 @@ def _process_chapter(page, ch_num, file_path, ctx: ChapterContext):
     log = ctx.log
     control = ctx.control or Control()
     recorder = ctx.recorder or HistoryRecorder(params.url)
-    title = params.title_pattern.format(ch=ch_num) if params.title_pattern else ""
+    title = resolve_chapter_title(params, ch_num)
 
     while True:
         success = False
@@ -1735,7 +1817,9 @@ def _process_chapter(page, ch_num, file_path, ctx: ChapterContext):
                     mark_official=params.official,
                     idle_timeout=ctx.idle_timeout,
                     log=log,
-                    on_chunk=(lambda c, n=ch_num: ctx.on_chunk(n, c)) if ctx.on_chunk else None,
+                    on_chunk=(lambda c, n=ch_num: ctx.on_chunk(n, c))
+                    if ctx.on_chunk
+                    else None,
                     control=control,
                 )
                 if success:

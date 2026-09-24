@@ -22,8 +22,8 @@ from unittest import mock
 # well as through unittest discovery: the engine lives in the project root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import core  # noqa: E402
-import parallel  # noqa: E402
+import core
+import parallel
 
 URL = "https://comix.to/title/1234-test-series"
 
@@ -110,20 +110,24 @@ class EngineTestCase(unittest.TestCase):
 
         summary = self._run(on_status=lambda ch, st, d: statuses.append((str(ch), st)))
 
-        self.assertEqual((summary.processed, summary.succeeded, summary.failed), (2, 2, 0))
+        self.assertEqual(
+            (summary.processed, summary.succeeded, summary.failed), (2, 2, 0)
+        )
         self.assertEqual(self._history(), {"1", "2"})
         self.assertIn(("1", "uploading"), statuses)
         self.assertIn(("2", "done"), statuses)
 
     def test_failure_is_recorded_and_does_not_stop_the_batch(self):
         self._chapters(1, 2)
-        core.upload_single_chapter = (
-            lambda **kw: (False, "boom") if kw["chapter_num"] == 1 else (True, None)
+        core.upload_single_chapter = lambda **kw: (
+            (False, "boom") if kw["chapter_num"] == 1 else (True, None)
         )
 
         summary = self._run()
 
-        self.assertEqual((summary.processed, summary.succeeded, summary.failed), (2, 1, 1))
+        self.assertEqual(
+            (summary.processed, summary.succeeded, summary.failed), (2, 1, 1)
+        )
         self.assertEqual(summary.failures[0][0], 1)
         self.assertEqual(summary.failures[0][2], "boom")
         self.assertEqual(self._failed(), {"1": "boom"})
@@ -133,7 +137,10 @@ class EngineTestCase(unittest.TestCase):
         self._chapters(1, 2)
         core.save_history(core.get_history_file(URL), {"1"})
         seen: list = []
-        core.upload_single_chapter = lambda **kw: (seen.append(kw["chapter_num"]), (True, None))[1]
+        core.upload_single_chapter = lambda **kw: (
+            seen.append(kw["chapter_num"]),
+            (True, None),
+        )[1]
 
         summary = self._run()
 
@@ -217,7 +224,9 @@ class EngineTestCase(unittest.TestCase):
         summary = self._run(on_status=lambda ch, st, d: statuses.append((str(ch), st)))
 
         # "pending" must never be counted or persisted.
-        self.assertEqual((summary.processed, summary.succeeded, summary.failed), (0, 0, 0))
+        self.assertEqual(
+            (summary.processed, summary.succeeded, summary.failed), (0, 0, 0)
+        )
         self.assertEqual(self._history(), set())
         self.assertEqual(self._failed(), {})
         self.assertIn(("1", "pending"), statuses)
@@ -289,7 +298,9 @@ class EngineTestCase(unittest.TestCase):
 
         parallel._run_parallel = boom
 
-        tail = core.RunSummary(processed=2, succeeded=1, failed=1, failures=[(3, "3.cbz", "x")])
+        tail = core.RunSummary(
+            processed=2, succeeded=1, failed=1, failures=[(3, "3.cbz", "x")]
+        )
         core.run_upload_batch = lambda **kw: tail
 
         out = parallel.run_upload_batch_auto(
@@ -367,14 +378,19 @@ class AttachUploadFileTests(unittest.TestCase):
             def evaluate(self, expression, arg=None):
                 # The probe-install script returns True; the state query
                 # returns the configured state.
-                return True if "comixFileProbe" in expression and "= 0" in expression else state
+                return (
+                    True
+                    if "comixFileProbe" in expression and "= 0" in expression
+                    else state
+                )
 
         return FakePage()
 
     def _attach(self, page, file_input):
         # Keep the poll loop instant in tests.
-        with mock.patch.object(core, "FILE_PROBE_POLL_TRIES", 2), mock.patch.object(
-            core, "FILE_PROBE_POLL_SECONDS", 0
+        with (
+            mock.patch.object(core, "FILE_PROBE_POLL_TRIES", 2),
+            mock.patch.object(core, "FILE_PROBE_POLL_SECONDS", 0),
         ):
             core.attach_upload_file(page, file_input, "C:/x/1.zip", lambda m: None)
 

@@ -17,7 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import core  # noqa: E402
+import core
 
 URL = "https://comix.to/title/1234-test-series"
 HID = "1234-test-series"
@@ -78,11 +78,15 @@ class HistoryLayoutTests(unittest.TestCase):
         self.assertFalse(old_history.exists(), "legacy history should be moved")
         self.assertFalse(old_failed.exists(), "legacy failed log should be moved")
         self.assertEqual(
-            json.loads((core.BASE_DIR / ".history" / "upload_history_abc.json").read_text()),
+            json.loads(
+                (core.BASE_DIR / ".history" / "upload_history_abc.json").read_text()
+            ),
             ["1", "2"],
         )
         self.assertEqual(
-            json.loads((core.BASE_DIR / ".history" / "upload_failed_abc.json").read_text()),
+            json.loads(
+                (core.BASE_DIR / ".history" / "upload_failed_abc.json").read_text()
+            ),
             {"3": "boom"},
         )
 
@@ -102,7 +106,9 @@ class HistoryLayoutTests(unittest.TestCase):
         core.get_history_file(URL)  # first call in the process adopts it
 
         self.assertFalse((core.BASE_DIR / ".upload_history_abc.json").exists())
-        self.assertTrue((core.BASE_DIR / ".history" / "upload_history_abc.json").exists())
+        self.assertTrue(
+            (core.BASE_DIR / ".history" / "upload_history_abc.json").exists()
+        )
 
     def test_migration_is_harmless_when_there_is_nothing_to_move(self):
         self.assertEqual(core.migrate_legacy_history(), [])
@@ -114,7 +120,9 @@ class HistoryLayoutTests(unittest.TestCase):
         core.save_history(core.get_history_file(URL), {"1", "2.5", "3"})
         core.save_failed(core.get_failed_file(URL), {"4": "timeout"})
 
-        self.assertEqual(core.load_history(core.get_history_file(URL)), {"1", "2.5", "3"})
+        self.assertEqual(
+            core.load_history(core.get_history_file(URL)), {"1", "2.5", "3"}
+        )
         self.assertEqual(core.load_failed(core.get_failed_file(URL)), {"4": "timeout"})
 
     def test_reset_history_clears_both_files(self):
@@ -133,8 +141,12 @@ class HistoryLayoutTests(unittest.TestCase):
 
         core.migrate_legacy_history()
 
-        self.assertTrue((core.BASE_DIR / ".history" / "upload_history_abc.json").exists())
-        self.assertTrue((core.BASE_DIR / ".history" / "upload_history_xyz.json").exists())
+        self.assertTrue(
+            (core.BASE_DIR / ".history" / "upload_history_abc.json").exists()
+        )
+        self.assertTrue(
+            (core.BASE_DIR / ".history" / "upload_history_xyz.json").exists()
+        )
 
 
 if __name__ == "__main__":
