@@ -77,15 +77,9 @@ def update_cookies_interactive(config: ConfigStore) -> None:
     print("Leave a field blank to keep its current value.")
     cf = input("cf_clearance value: ").strip()
     session = input("session value (optional): ").strip()
-    changed = set_config_cookies(
-        config.data, {"cf_clearance": cf, "session": session}
-    )
+    changed = set_config_cookies(config.data, {"cf_clearance": cf, "session": session})
     config.reload()
-    print(
-        "[✓] Cookies updated in config.json."
-        if changed
-        else "[i] Nothing changed."
-    )
+    print("[✓] Cookies updated in config.json." if changed else "[i] Nothing changed.")
 
 
 def collect_params(config: ConfigStore) -> UploadParams:
@@ -298,9 +292,7 @@ def main() -> None:
             print("run again.")
 
         def cf_resolved(restart: bool):
-            # The engine calls this after a Cloudflare wait: restart=True means
-            # its first wait window expired, so relaunch Chrome once and let it
-            # re-run the check from scratch.
+            # restart=True: the first wait window expired, so relaunch once.
             nonlocal context, page
             if restart:
                 try:

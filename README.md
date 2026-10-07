@@ -236,7 +236,7 @@ default is 180.
 `worker_stall_timeout_seconds` is the safety net for a tab that stops
 responding. Playwright's `page.title()` / `page.content()` / `page.evaluate()`
 carry **no timeout at all**, so a wedged renderer used to block its worker - and
-  therefore the whole batch - forever, with the chapter stuck on "uploading" and
+therefore the whole batch - forever, with the chapter stuck on "uploading" and
 no error. Every check now reads the page through a call that _does_ have a
 deadline, and a worker that reports no progress for this long is abandoned by
 name (`Tab N stopped making progress on chapter X`) and its chapter handed to

@@ -1,29 +1,15 @@
 """Automatic Cloudflare clearance for the comix uploader.
 
-Why this exists
----------------
-The uploader drives Chrome with stock Playwright, and Playwright emits the CDP
-``Runtime.enable`` command when it attaches. Cloudflare's challenge page
-detects that automation-protocol signal, so a real Chrome driven by Playwright
-sits on "Verifying you are human" forever. The fix (the same idea Kotatsu-Redo
-uses with its Android WebView) is to let a browser that does NOT emit that
-signal solve the challenge, then hand the resulting ``cf_clearance`` cookie to
-the uploader.
+Stock Playwright emits the CDP ``Runtime.enable`` signal on attach, which
+Cloudflare's challenge detects - so a Playwright-driven Chrome hangs on
+"Verifying you are human" forever. This lets a browser that does NOT emit that
+signal (patchright, a Playwright fork, in a separate process) solve the
+challenge, then hands the ``cf_clearance`` cookie to the uploader. It uses the
+real system Chrome so its User-Agent matches, since ``cf_clearance`` is bound to
+the exact UA and IP that earned it.
 
-Design
-------
-* ``mint_clearance`` runs inside a **separate process** (``python -m solver``)
-  driven by **patchright** - a drop-in Playwright fork that avoids the
-  ``Runtime.enable`` leak. It uses the real system Chrome
-  (``channel="chrome"``) so its User-Agent matches the uploader's, because
-  ``cf_clearance`` is bound to the exact UA (and IP) that earned it.
-* The parent process (the uploader) never imports patchright. It calls
-  ``solve_via_subprocess`` and injects the harvested cookies into its own
-  browser context via ``make_cf_solver_hook``.
-
-Import discipline: the module top level is stdlib-only, so ``import solver`` is
-safe in tests and in ``core.py``. ``patchright`` is imported lazily inside
-``mint_clearance``.
+The module top level is stdlib-only (``import solver`` is safe in tests and
+``core.py``); patchright is imported lazily inside ``mint_clearance``.
 """
 
 from __future__ import annotations
@@ -46,9 +32,8 @@ SOLVER_PROFILE_DIR = BASE_DIR / "solver_profile"
 # Cookie names worth harvesting (and re-injecting) from the solved browser.
 CLEARANCE_HINTS = ("cf_clearance", "__cf_bm", "cf_chl", "challenge", "clearance")
 
-# The only fields Playwright's context.add_cookies() accepts. patchright's
-# cookies() returns extra keys (partitionKey, _crHasCrossSiteAncestor, ...) that
-# would make the uploader's add_cookies() raise, so they are stripped.
+# Only fields Playwright's add_cookies() accepts; patchright's cookies() adds
+# extras that would make add_cookies() raise.
 COOKIE_FIELDS = (
     "name",
     "value",
@@ -67,9 +52,8 @@ DEFAULT_FOCUS_AFTER = 15.0
 # workers share one browser, so one solve covers all of them).
 RECENT_SOLVE_SECONDS = 30.0
 
-# The proxy the parent wants this child to use, as JSON. Passed through the
-# environment rather than argv so an authenticated proxy's password never shows
-# up in the child's command line.
+# The parent's chosen proxy, as JSON, passed via the environment (not argv) so
+# an authenticated proxy's password never shows up in the child's command line.
 PROXY_ENV_VAR = "COMIX_SOLVER_PROXY"
 
 # Serialises solver subprocesses and remembers the last successful solve.
@@ -266,11 +250,14 @@ def _proxy_from_env() -> dict | None:
 
 def main(argv=None) -> int:
     """Subprocess entry point: one JSON object on stdout, logs on stderr."""
-    parser = argparse.ArgumentParser(description="Mint a Cloudflare cf_clearance cookie.")
+    parser = argparse.ArgumentParser(
+        description="Mint a Cloudflare cf_clearance cookie."
+    )
     parser.add_argument("--url", default=core.SITE_ROOT)
     parser.add_argument("--max-wait", type=float, default=DEFAULT_MAX_WAIT)
     parser.add_argument(
-        "--window-mode", choices=("offscreen", "focus", "headless"),
+        "--window-mode",
+        choices=("offscreen", "focus", "headless"),
         default=DEFAULT_WINDOW_MODE,
     )
     parser.add_argument("--focus-after", type=float, default=DEFAULT_FOCUS_AFTER)
@@ -400,7 +387,9 @@ def make_cf_solver_hook(config: dict, log: Callable = print) -> Callable:
                 **_solver_kwargs(cf),
             )
             if not result.get("ok"):
-                logger(f"[!] Cloudflare solver failed: {result.get('error') or 'unknown'}")
+                logger(
+                    f"[!] Cloudflare solver failed: {result.get('error') or 'unknown'}"
+                )
                 return False
 
             cookies = result.get("cookies", [])
@@ -448,9 +437,7 @@ def solve_into_config(config_store, log: Callable = print) -> bool:
     values = {c["name"]: c.get("value", "") for c in result.get("cookies", [])}
     core.set_config_cookies(config_store.data, values)
     config_store.reload()
-    _last_result.update(
-        ts=time.time(), ok=True, cookies=result.get("cookies", [])
-    )
+    _last_result.update(ts=time.time(), ok=True, cookies=result.get("cookies", []))
     log("[✓] Cloudflare clearance obtained and saved.")
     return True
 

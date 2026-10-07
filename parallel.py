@@ -1,27 +1,13 @@
 """Parallel chapter uploads on tabs of the one persistent Chrome.
 
-How it works: the session already owns the persistent Chrome (launched with
-``core.launch_context(enable_cdp=True)``). Each worker thread starts its own
-Playwright instance and attaches to that same browser through the DevTools
-endpoint (``core.read_devtools_port()``), then drives its own tab. Because the
-workers share the browser, they share the profile, the login and the Cloudflare
-clearance cookie - one clearance covers the whole batch.
+Each worker thread starts its own Playwright instance, attaches to the shared
+browser over the DevTools endpoint, and drives its own tab. Because they share
+the browser, they share the profile, login and clearance cookie - one clearance
+covers the whole batch. Playwright's sync API is thread-affine, so a worker only
+ever drives its own page.
 
-Verified with a spike before this module existed:
-  * ``--remote-debugging-port=0`` coexists with Playwright's internal
-    ``--remote-debugging-pipe``, and the ``DevToolsActivePort`` file appears.
-  * ``connect_over_cdp`` reaches the persistent default context.
-  * Cookies are shared across connections. Pages are NOT visible across
-    connections - each worker polls its own tab, which is all it needs
-    (``_live_site_pages`` reads ``page.context.pages``, i.e. its own view).
-  * Disconnecting a worker (page.close + pw.stop) leaves the browser and the
-    other workers untouched.
-  * Playwright's sync API is thread-affine: every playwright object is driven
-    only from the thread that created it. The coordinator exchanges plain data
-    with workers and never touches their pages.
-
-Anything that goes wrong here degrades to the sequential engine with a clear
-log line - parallel uploads must never be able to break a run.
+Anything that goes wrong here degrades to the sequential engine with a clear log
+line - parallel uploads must never be able to break a run.
 """
 
 from __future__ import annotations
@@ -65,9 +51,7 @@ def run_upload_batch_auto(page, endpoint, config: dict, params, **kwargs) -> Run
     try:
         n = core.validate_concurrency(config.get("concurrency", DEFAULT_CONCURRENCY))
     except core.ConfigError as ex:
-        # load_config() rejects this at startup, so this only guards callers
-        # that hand-build a config dict. Say exactly what is wrong, then run
-        # sequentially rather than refusing to work at all.
+        # Guard for callers that hand-build a config; run sequentially.
         log(f"[!] {ex}")
         n = 1
 
@@ -75,8 +59,10 @@ def run_upload_batch_auto(page, endpoint, config: dict, params, **kwargs) -> Run
     # so a run does not stall on the first chapter. Never let it break a run.
     hook = kwargs.get("cf_solver_hook")
     try:
-        if hook and page is not None and core.cloudflare_config(config).get(
-            "preflight_solve"
+        if (
+            hook
+            and page is not None
+            and core.cloudflare_config(config).get("preflight_solve")
         ):
             log("[i] Checking Cloudflare clearance before starting…")
             hook(page.context, log)
@@ -133,24 +119,15 @@ def _sleep_between_chapters(delay, control: Control) -> None:
         time.sleep(1)
 
 
-# Seconds without a heartbeat before a worker is treated as wedged.
-#
-# Playwright's page.title()/content()/evaluate()/newPage() carry NO timeout, so
-# a tab whose renderer has wedged blocks its worker thread forever. Nothing can
-# interrupt that call, so the only defence is to stop waiting for it.
-#
-# The floor. When the config does not set "worker_stall_timeout_seconds" the
-# real budget is derived from the per-chapter idle timeout (see _stall_timeout)
-# so the watchdog can never fire on a chapter that is still within its own
-# "no chunk progress" window.
+# Seconds without a heartbeat before a worker is treated as wedged. Playwright's
+# page.title()/content()/evaluate() take no timeout, so a wedged tab blocks its
+# worker forever. The real budget is derived from the idle timeout (see
+# _stall_timeout) so the watchdog cannot fire while a chapter is still inside its
+# own "no chunk progress" window.
 DEFAULT_WORKER_STALL_SECONDS = 180.0
 
-# How many times one worker may throw away a tab and open a fresh one.
-#
-# A replaced tab can NOT be closed - Playwright's Page.close() takes no timeout,
-# so closing a wedged tab is exactly the call that would hang. Replacements are
-# therefore bounded: without a cap a worker leaks a tab per chapter, which is
-# how a 243-chapter run ended up with Chrome's tab count climbing continuously.
+# Cap on tab replacements per worker. A replaced tab cannot be closed (close()
+# has no timeout), so replacements are bounded or a worker leaks a tab per chapter.
 MAX_TAB_REPLACEMENTS = 3
 
 
@@ -186,9 +163,8 @@ def _fresh_tab(context, config: dict):
 def _tab_is_dead(page) -> bool:
     """True only when the tab fails TWO consecutive bounded liveness probes.
 
-    One failed probe can just be a busy renderer - a 20 MB upload keeps the
-    main thread occupied - and a false positive is expensive, because the tab
-    is replaced and the old one cannot be closed.
+    One failed probe may just be a busy renderer; a false positive is costly
+    because the tab is replaced and the old one cannot be closed.
     """
     if core.page_is_responsive(page):
         return False
@@ -200,14 +176,11 @@ def _chapter_label(chapter) -> str:
 
 
 class WorkerHeartbeat:
-    """Per-worker liveness handle shared between a worker and the coordinator.
+    """Per-worker liveness handle shared with the coordinator.
 
-    ``beat()`` says "still working". ``abandoned`` is set by the coordinator
-    when it stops waiting for a worker, and the worker MUST check it and exit:
-    its blocked call may eventually time out, and a worker that silently
-    resumed would keep pulling chapters from the shared queue - uploading them
-    at the same time as the sequential retry, which is what produced duplicate
-    chapters and a chapter recorded as both done and failed.
+    ``beat()`` marks progress; ``abandoned`` is set when the coordinator stops
+    waiting, and the worker must exit on it so it does not upload alongside the
+    sequential retry (which duplicated chapters).
     """
 
     def __init__(self, index: int, progress: dict, lock) -> None:
@@ -227,16 +200,12 @@ class WorkerHeartbeat:
 
 
 def _run_workers_with_deadline(targets, stall_timeout: float, log):
-    """Run ``targets`` on daemon threads, and never wait on a wedged one.
+    """Run ``targets`` on daemon threads, never waiting on a wedged one.
 
-    ``targets`` is a list of callables ``fn(heartbeat) -> list[rows]``, each
-    given its own :class:`WorkerHeartbeat`. A worker that stops calling
-    ``heartbeat.beat()`` for ``stall_timeout`` seconds is treated as wedged: it
-    is marked ``abandoned`` (so it stops as soon as it can) and left behind.
-
-    Daemon threads rather than a ThreadPoolExecutor on purpose: pool threads
-    are non-daemon and are joined at interpreter exit, so a single wedged
-    worker would freeze the batch *and* block the app from closing.
+    Each target is ``fn(heartbeat) -> list[rows]``. A worker silent for
+    ``stall_timeout`` seconds is marked ``abandoned`` and left behind. Daemon
+    threads (not a pool) so a wedged worker cannot freeze the batch or block app
+    exit.
 
     Returns ``(rows, worker_errors, stalled_chapters)``.
     """
@@ -301,12 +270,10 @@ def _run_parallel(
 ):
     """Run the batch on ``n`` worker tabs. Returns (stragglers, worker_failed).
 
-    ``stragglers`` are chapter numbers that were left "pending" (a gate
-    outlasted its window, or the user stopped); ``worker_failed`` means a
-    worker could not do its job at all. Either way the caller gives what is
-    left to the sequential engine, which re-scans and skips finished chapters.
-    An "aborted" chapter (origin down / CF stuck) sets ``summary.aborted`` and
-    is never handed to the sequential tail.
+    ``stragglers`` are chapters left "pending"; ``worker_failed`` means a worker
+    could not run at all. Either way the caller finishes the rest sequentially
+    (which re-scans and skips finished chapters). An "aborted" chapter is never
+    handed to the sequential tail.
     """
     log = kwargs.get("log") or print
     control = kwargs.get("control") or Control()
@@ -327,8 +294,8 @@ def _run_parallel(
     challenge_poll = float(challenge_cfg.get("poll_interval_seconds", 2))
     focus = bool(config.get("focus_on_challenge", True))
 
-    # Worker contexts: no restart (it would kill the other workers' uploads)
-    # and no hooks (they hand back the session's page - never a worker's).
+    # Worker contexts: no restart (would kill other workers) and no hooks (they
+    # return the session's page, never a worker's).
     shared = {
         k: v
         for k, v in kwargs.items()
@@ -348,11 +315,8 @@ def _run_parallel(
     def make_ctx(context, state: WorkerHeartbeat) -> ChapterContext:
         """One worker's context.
 
-        ``on_status``/``on_chunk`` are wrapped rather than passed straight
-        through, so every status change and every uploaded chunk also feeds the
-        stall watchdog (``state.beat``). ``on_heartbeat`` additionally lets the
-        challenge wait and the upload poll loop keep beating while they are
-        legitimately waiting.
+        Wraps ``on_status``/``on_chunk`` so each also feeds the stall watchdog
+        (``state.beat``), and wires ``on_heartbeat`` so long waits keep beating.
         """
         outer_status = shared.get("on_status")
         outer_chunk = shared.get("on_chunk")
@@ -401,10 +365,8 @@ def _run_parallel(
             while True:
                 if control.stopped or control.aborted:
                     break
-                # The coordinator gave up on this worker. Stop rather than
-                # carry on: resuming here would upload chapters at the same time
-                # as the sequential retry, which is how the same chapter ended
-                # up both uploaded twice and recorded as done AND failed.
+                # Coordinator gave up on this worker: stop, so it does not upload
+                # alongside the sequential retry (which duplicated chapters).
                 if state.abandoned:
                     log(f"[i] Tab {state.index + 1} was abandoned - stopping it.")
                     break
@@ -416,13 +378,9 @@ def _run_parallel(
                 except queue.Empty:
                     break
 
-                # A challenge is free to move or close a tab, so keep this
-                # worker's handle alive (same reason session._ensure_page
-                # exists for the sequential path). A tab that stopped answering
-                # is the hang case: every Playwright call on it would block, so
-                # work moves to a fresh tab. Replacements are capped and the old
-                # tab is left alone - Page.close() has no timeout, so closing a
-                # wedged tab is itself the call that would hang.
+                # A tab that stopped answering is the hang case: every call on it
+                # would block, so work moves to a fresh tab (capped; the old tab is
+                # left alone as close() has no timeout).
                 if page.is_closed():
                     replacements += 1
                     log("[i] A parallel tab was closed - opening a new one.")
@@ -443,8 +401,7 @@ def _run_parallel(
                     )
                     page = _fresh_tab(context, config)
 
-                # Tell the watchdog which chapter this tab is on, once the tab
-                # it will actually use has been chosen.
+                # Tell the watchdog which chapter this tab is on.
                 state.beat(ch_num)
 
                 status, err, _page = _process_chapter(page, ch_num, file_path, ctx)
@@ -457,9 +414,8 @@ def _run_parallel(
         except Exception:
             rows.append((None, None, "error", traceback.format_exc()))
         finally:
-            # Disconnecting alone leaves this worker's tab behind in Chrome
-            # (usually sitting on about:blank); close it first. Skipped when the
-            # tab is the reason we are leaving - close() would block on it.
+            # Disconnecting leaves this worker's tab behind; close it first
+            # (skipped when the tab is why we are leaving - close() would block).
             try:
                 if page is not None and not page.is_closed():
                     page.close()
@@ -496,10 +452,9 @@ def _run_parallel(
 
 
 def _aggregate_results(results, worker_errors, summary: RunSummary) -> list:
-    """Fold worker rows into ``summary``; return the straggler chapter numbers.
+    """Fold worker rows into ``summary``; return the straggler chapters.
 
-    An "aborted" row (origin down / CF stuck) sets ``summary.aborted`` and is
-    NOT added to the stragglers - the sequential tail must not re-run it.
+    An "aborted" row is set on the summary and NOT added to the stragglers.
     """
     stragglers = []
     for ch_num, file_path, status, err in results:

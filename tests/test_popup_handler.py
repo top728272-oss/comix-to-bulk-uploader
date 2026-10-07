@@ -1,13 +1,10 @@
 """Tests for core.install_popup_handler - no browser, no network.
 
-Pins down the popup/worker-tab discrimination: parallel upload workers create
-their tabs via ``context.new_page()`` on shared Chrome, and every connection
-(the session's owner and each worker's own) sees those tabs. The handler must
-only close pages that were opened BY another page (ad popups), never tabs
-with no opener - otherwise parallel workers kill each other and the run
-collapses to sequential.
+Pins down popup/worker-tab discrimination: every CDP connection sees every tab,
+so the handler must close only tabs WITH an opener (ad popups) and never the
+opener-less tabs parallel workers create.
 
-Run from the project root:  .venv\\Scripts\\python.exe -m unittest discover tests
+Run: .venv\\Scripts\\python.exe -m unittest discover tests
 """
 
 from __future__ import annotations

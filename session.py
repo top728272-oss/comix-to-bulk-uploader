@@ -43,9 +43,8 @@ class BrowserSession(threading.Thread):
         self.playwright = None
         self.context = None
         self.page = None
-        # Parallel uploads need the DevTools endpoint, so the browser is
-        # launched with CDP enabled whenever concurrency > 1. These track what
-        # the open browser was launched with.
+        # Tracks what the open browser was launched with: parallel uploads need
+        # CDP, so it is enabled whenever concurrency > 1.
         self._cdp_on = False
         self.cdp_endpoint: str | None = None
         self._running = True
@@ -132,9 +131,8 @@ class BrowserSession(threading.Thread):
             return
 
         if kind == "set_cookies":
-            # Manual cookie paste (e.g. a fresh cf_clearance when Cloudflare is
-            # stuck on "Verifying you are human"). Persist, reload, and inject
-            # into the live browser so the next attempt uses them.
+            # Manual cf_clearance paste: persist, reload, and inject into the
+            # live browser so the next attempt uses it.
             values = job[1]
             changed = set_config_cookies(self.config.data, values)
             self.config.reload()
@@ -144,9 +142,11 @@ class BrowserSession(threading.Thread):
                 )
             self.emit(
                 "log",
-                "[✓] Cookies updated and applied."
-                if changed
-                else "[i] Cookies unchanged.",
+                (
+                    "[✓] Cookies updated and applied."
+                    if changed
+                    else "[i] Cookies unchanged."
+                ),
             )
             return
 
@@ -234,9 +234,8 @@ class BrowserSession(threading.Thread):
                 except Exception:
                     self.context = None
             else:
-                # The concurrency setting changed since this browser started
-                # (the DevTools endpoint is a launch flag), so relaunch. The
-                # profile keeps the login and the clearance cookies.
+                # CDP is a launch flag, so a changed concurrency needs a relaunch
+                # (the profile keeps the login and clearance cookies).
                 self._log("[i] Concurrency changed - restarting Chrome to match.")
                 self._close_context()
 
@@ -337,9 +336,7 @@ class BrowserSession(threading.Thread):
                 on_cloudflare=on_cloudflare,
                 cf_resolved_hook=self._cf_resolved,
                 on_cloudflare_stuck=on_cloudflare_stuck,
-                cf_solver_hook=solver.make_cf_solver_hook(
-                    self.config.data, self._log
-                ),
+                cf_solver_hook=solver.make_cf_solver_hook(self.config.data, self._log),
                 on_challenge_cleared=on_challenge_cleared,
                 max_retries=self.config.max_retries,
             )

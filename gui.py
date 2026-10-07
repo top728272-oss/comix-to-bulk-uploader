@@ -93,9 +93,8 @@ class App(tk.Tk):
             reverse=True,
         )
         self.series_panel_open = True
-        # Chapter titles imported from rename.py's chapter_mapping.txt.
-        # While a map is active it owns the titles and the pattern entry
-        # is disabled (its value still serves as the fallback for misses).
+        # Chapter titles from rename.py's chapter_mapping.txt. An active map owns
+        # the titles; the pattern value stays as the fallback for misses.
         self.title_map: dict | None = None
         self.title_map_name = ""
 
@@ -497,18 +496,14 @@ class App(tk.Tk):
             card, text="Refresh Cloudflare", command=self.refresh_clearance, width=18
         ).pack(side="right")
 
-        # Cookie update row: when Cloudflare is stuck on "Verifying you are
-        # human" (or the login expired), refreshing no longer clears it - paste
-        # fresh cookies here instead of hand-editing config.json.
+        # Manual cookie paste for when refreshing will not clear the check.
         cookie_card = ttk.Frame(parent, style="Card.TFrame", padding=8)
         cookie_card.pack(fill="x", pady=(0, 8))
         ttk.Label(cookie_card, text="cf_clearance", style="Sub.TLabel").pack(
             side="left"
         )
         self.cf_cookie_var = tk.StringVar()
-        self.cf_cookie_entry = ttk.Entry(
-            cookie_card, textvariable=self.cf_cookie_var
-        )
+        self.cf_cookie_entry = ttk.Entry(cookie_card, textvariable=self.cf_cookie_var)
         self.cf_cookie_entry.pack(side="left", fill="x", expand=True, padx=(4, 8))
         ttk.Label(cookie_card, text="session", style="Sub.TLabel").pack(side="left")
         self.session_cookie_var = tk.StringVar()
@@ -638,10 +633,10 @@ class App(tk.Tk):
         self._save_concurrency()
 
     def _save_concurrency(self) -> None:
-        """Persist the spinbox value, clamped to the allowed range.
+        """Persist the spinbox value, clamped to range.
 
-        The spinbox only fires `command` on arrow clicks, so a typed value is
-        picked up when a run starts (start_upload calls this too).
+        The spinbox only fires `command` on arrow clicks, so typed values are
+        also read when a run starts.
         """
         try:
             value = int(self.concurrency_var.get())

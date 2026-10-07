@@ -1,17 +1,11 @@
 """Windows-only helpers for locating and moving the Chrome window the app drives.
 
-The uploader runs a headful Chrome (the Cloudflare check needs a human in
-front of it), but that does not mean it is allowed to grab the desktop. This
-module is the escape hatch: it finds the exact top-level window belonging to
-*our* browser process and can restore/foreground it when a verification needs
-solving.
+A headful Chrome (the Cloudflare check needs a human) must not grab the desktop,
+so this finds the exact top-level window of *our* browser process (by PID, so the
+user's own Chrome is never touched) and can restore/foreground it.
 
-Design rules:
-  * stdlib only -- ctypes, no pywin32, nothing new in requirements.txt.
-  * Every entry point no-ops (returns False/None) off Windows, when ctypes is
-    unavailable, or when the window cannot be found. Nothing here raises.
-  * The browser is identified by PID, so the user's own Chrome windows are
-    never touched.
+Design rules: stdlib only (ctypes); every entry point no-ops off Windows, without
+ctypes, or when the window is not found; nothing here raises.
 """
 
 from __future__ import annotations

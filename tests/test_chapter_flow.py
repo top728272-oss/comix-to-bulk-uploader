@@ -1,13 +1,10 @@
 """Behaviour tests for the upload engine - no browser, no network.
 
-Two things are being pinned down here:
+Pins down the sequential semantics kept by the ChapterContext refactor, and
+that parallel.run_upload_batch_auto picks the right engine and always degrades
+to the sequential one.
 
-1. The ChapterContext/_process_chapter refactor kept the sequential semantics
-   intact (success / failure / stop / gate-cleared / gate-expired paths).
-2. parallel.run_upload_batch_auto picks the right engine and always degrades to
-   the sequential one instead of failing a run.
-
-Run from the project root:  .venv\\Scripts\\python.exe -m unittest discover tests
+Run: .venv\\Scripts\\python.exe -m unittest discover tests
 """
 
 from __future__ import annotations
@@ -450,7 +447,9 @@ class ServerDownAbortTests(EngineHarness, unittest.TestCase):
 
         parallel._run_parallel = fake_parallel
         tail_calls: list = []
-        core.run_upload_batch = lambda **kw: (tail_calls.append(kw), core.RunSummary())[1]
+        core.run_upload_batch = lambda **kw: (tail_calls.append(kw), core.RunSummary())[
+            1
+        ]
 
         out = parallel.run_upload_batch_auto(
             page=self.page,
@@ -461,7 +460,9 @@ class ServerDownAbortTests(EngineHarness, unittest.TestCase):
         )
 
         self.assertTrue(out.aborted)
-        self.assertEqual(tail_calls, [], "the sequential tail must not re-run aborted work")
+        self.assertEqual(
+            tail_calls, [], "the sequential tail must not re-run aborted work"
+        )
 
     def test_parallel_aggregation_marks_abort(self):
         summary = core.RunSummary()
@@ -488,9 +489,7 @@ class AccessBlockTests(EngineHarness, unittest.TestCase):
         self._chapters(1, 2)
         control = core.Control()
         statuses: list[tuple] = []
-        message = (
-            "Cloudflare blocked this IP on the upload path (Ray ID deadbeef1234)."
-        )
+        message = "Cloudflare blocked this IP on the upload path (Ray ID deadbeef1234)."
 
         def fake_upload(**kw):
             raise core.AccessBlockedError(message, ray_id="deadbeef1234")
@@ -947,9 +946,7 @@ class CookiePasteTests(unittest.TestCase):
 
     def test_updates_in_place_and_appends(self):
         config = {
-            "cookies": [
-                {"name": "cf_clearance", "value": "old", "url": core.SITE_ROOT}
-            ]
+            "cookies": [{"name": "cf_clearance", "value": "old", "url": core.SITE_ROOT}]
         }
 
         changed = core.set_config_cookies(
@@ -1057,9 +1054,8 @@ class AttachUploadFileTests(unittest.TestCase):
 
         class FakeHandle:
             def evaluate(self, expression, arg=None, timeout=None):
-                # The probe-install script returns True; the state query
-                # returns the configured state. (Both run through a locator
-                # handle, so the call carries a timeout.)
+                # Install script returns True; the state query returns the
+                # configured state.
                 return (
                     True
                     if "comixFileProbe" in expression and "= 0" in expression
