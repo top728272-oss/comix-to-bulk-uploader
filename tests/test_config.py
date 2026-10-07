@@ -108,5 +108,31 @@ class ConcurrencyValidationTests(unittest.TestCase):
         self.assertEqual(core.ConfigStore().concurrency, 2)
 
 
+class CloudflareConfigTests(unittest.TestCase):
+    """The "cloudflare" solver block merges over defaults."""
+
+    def test_defaults_when_block_missing(self):
+        cfg = core.cloudflare_config({})
+        self.assertTrue(cfg["auto_solve"])
+        self.assertFalse(cfg["preflight_solve"])
+        self.assertEqual(cfg["solve_max_wait_seconds"], 90)
+        self.assertEqual(cfg["solve_window_mode"], "offscreen")
+        self.assertEqual(cfg["solve_focus_after_seconds"], 15)
+
+    def test_partial_block_overrides_only_its_keys(self):
+        cfg = core.cloudflare_config(
+            {"cloudflare": {"auto_solve": False, "solve_window_mode": "focus"}}
+        )
+        self.assertFalse(cfg["auto_solve"])
+        self.assertEqual(cfg["solve_window_mode"], "focus")
+        self.assertEqual(cfg["solve_max_wait_seconds"], 90)  # default kept
+
+    def test_non_dict_block_is_ignored(self):
+        self.assertEqual(
+            core.cloudflare_config({"cloudflare": "nonsense"}),
+            core.cloudflare_config({}),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

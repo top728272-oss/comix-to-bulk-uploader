@@ -25,9 +25,11 @@ from core import (
     read_devtools_port,
     reset_history,
     scan_folder,
+    set_config_cookies,
     sync_cookies_from_context,
 )
 from parallel import run_upload_batch_auto
+import solver
 
 
 def prompt_input(prompt_text: str, default_val: str = "") -> str:
@@ -60,6 +62,30 @@ def refresh_clearance_interactive(config: ConfigStore) -> None:
         config.reload()
         print("[✓] Fresh cookies captured and saved to config.json.")
         context.close()
+
+
+def update_cookies_interactive(config: ConfigStore) -> None:
+    """Paste a fresh cf_clearance (and optionally session) into config.json.
+
+    Cloudflare can no longer be cleared by refreshing and can get stuck on
+    "Verifying you are human" — copying the cookie out of a browser that is
+    already past the check is the reliable fix.
+    """
+    print("\n" + "=" * 50)
+    print("            PASTE CLOUDFLARE COOKIES")
+    print("=" * 50)
+    print("Leave a field blank to keep its current value.")
+    cf = input("cf_clearance value: ").strip()
+    session = input("session value (optional): ").strip()
+    changed = set_config_cookies(
+        config.data, {"cf_clearance": cf, "session": session}
+    )
+    config.reload()
+    print(
+        "[✓] Cookies updated in config.json."
+        if changed
+        else "[i] Nothing changed."
+    )
 
 
 def collect_params(config: ConfigStore) -> UploadParams:
@@ -166,10 +192,12 @@ def summary_menu(params: UploadParams) -> str:
         print("  [3] List already uploaded chapters")
         print("  [4] Show failed chapters log")
         print("  [5] Reset history for this series")
-        print("  [6] Refresh Cloudflare clearance / login")
-        print("  [7] Exit")
+        print("  [6] Auto-solve Cloudflare (patchright)")
+        print("  [7] Refresh Cloudflare clearance / login (manual)")
+        print("  [8] Paste Cloudflare cookies (cf_clearance / session)")
+        print("  [9] Exit")
 
-        choice = input("\nSelect an action [1-7]: ").strip()
+        choice = input("\nSelect an action [1-9]: ").strip()
 
         if choice == "1":
             if not pending:
@@ -202,8 +230,12 @@ def summary_menu(params: UploadParams) -> str:
                 pending = list(items)
                 print("History and failure logs reset.")
         elif choice == "6":
-            return "refresh"
+            return "solve_cf"
         elif choice == "7":
+            return "refresh"
+        elif choice == "8":
+            return "paste_cookies"
+        elif choice == "9":
             return "exit"
 
 
@@ -223,8 +255,15 @@ def main() -> None:
         if action == "exit":
             print("Exiting.")
             return
+        if action == "solve_cf":
+            if not solver.solve_into_config(config):
+                print("[!] Auto-solve failed — try option [8] to paste cookies.")
+            continue
         if action == "refresh":
             refresh_clearance_interactive(config)
+            continue
+        if action == "paste_cookies":
+            update_cookies_interactive(config)
             continue
         break
 
@@ -249,15 +288,14 @@ def main() -> None:
             print("comix's Cloudflare check usually clears by itself — the run")
             print("resumes on its own. Keep this terminal open.")
 
-        def on_waf(ch_num):
-            # No input() here: the engine polls the tab itself and carries on
-            # as soon as the challenge page navigates away.
+        def on_cloudflare_stuck(ch_num):
             print("\n" + "=" * 60)
-            print("  [!] SECURITY CHECK — comix wants you to verify you're human")
+            print("  [!] CLOUDFLARE STUCK ON 'VERIFYING YOU ARE HUMAN'")
             print("=" * 60)
-            print(f"Paused on chapter {ch_num}. Nothing was skipped or marked failed.")
-            print("In the Chrome window, drag the circle until the picture lines")
-            print("up, then press Verify. Uploading resumes on its own.")
+            print(f"Stopped on chapter {ch_num}. Nothing was marked failed.")
+            print("The automatic solver could not clear it either — get a fresh")
+            print("cf_clearance cookie and use menu option [8] to paste it, then")
+            print("run again.")
 
         def cf_resolved(restart: bool):
             # The engine calls this after a Cloudflare wait: restart=True means
@@ -279,8 +317,7 @@ def main() -> None:
             return page
 
         def on_challenge_cleared(kind, ch_num):
-            label = "Cloudflare" if kind == "cloudflare" else "Security check"
-            print(f"[✓] {label} cleared on chapter {ch_num:g}. Resuming...")
+            print(f"[✓] Cloudflare cleared on chapter {ch_num:g}. Resuming...")
 
         try:
             summary = run_upload_batch_auto(
@@ -291,8 +328,8 @@ def main() -> None:
                 control=control,
                 on_cloudflare=on_cloudflare,
                 cf_resolved_hook=cf_resolved,
-                on_waf=on_waf,
-                waf_resolved_hook=lambda: page,
+                on_cloudflare_stuck=on_cloudflare_stuck,
+                cf_solver_hook=solver.make_cf_solver_hook(config.data, print),
                 on_challenge_cleared=on_challenge_cleared,
                 max_retries=config.max_retries,
             )
@@ -311,6 +348,13 @@ def main() -> None:
     print(f"Processed : {summary.processed}")
     print(f"Uploaded  : {summary.succeeded}")
     print(f"Failed    : {summary.failed}")
+    if getattr(summary, "aborted", False):
+        print(
+            "[!] Server appears down — the batch was stopped. Nothing was "
+            "marked failed; try again once comix is back."
+        )
+        if summary.abort_reason:
+            print(f"    ({summary.abort_reason})")
     for ch, filename, err in summary.failures:
         print(f"  - Chapter {ch:g} ({filename}): {err}")
     print(f"\nFailed details saved to {get_failed_file(params.url)}")

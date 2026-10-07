@@ -9,9 +9,10 @@ req headers.txt
 
 # Browser profile & cache
 browser_profile/
+solver_profile/
 __pycache__/
 *.pyc
-
+AGENTS.md
 # Upload state & history files (current layout + pre-.history leftovers)
 .history/
 .upload_history_*.json
@@ -23,7 +24,8 @@ series_library.json
 *.html
 *.log
 
-# WAF challenge debug dumps & HAR captures
+# Challenge debug dumps & HAR captures
+.challenge_debug/
 .waf_debug/
 *.har
 
@@ -33,3 +35,6 @@ series_library.json
 # Read-only collector (standalone, intentionally untracked)
 collect.py
 collect_out/
+adult_scan.py
+adult_out/
+analysis

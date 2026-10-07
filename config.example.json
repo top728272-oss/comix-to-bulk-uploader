@@ -1,5 +1,4 @@
 {
-  "user_agent": "YOUR_USER_AGENT",
   "cookies": [
     {
       "name": "remember_web_<YOUR_HASHED_ID>",
@@ -21,12 +20,26 @@
   "default_delay_seconds": 6,
   "max_retries": 3,
   "concurrency": 5,
+  "worker_stall_timeout_seconds": 180,
   "timeout_seconds": 180,
   "keep_window_in_background": true,
   "focus_on_challenge": true,
-  "waf": {
+  "challenge": {
     "max_wait_seconds": 600,
     "poll_interval_seconds": 2,
     "max_pauses_per_chapter": 5
+  },
+  "cloudflare": {
+    "auto_solve": true,
+    "preflight_solve": false,
+    "solve_max_wait_seconds": 90,
+    "solve_window_mode": "offscreen",
+    "solve_focus_after_seconds": 15
+  },
+  "proxy": {
+    "server": "",
+    "username": "",
+    "password": "",
+    "bypass": ""
   }
 }

@@ -1,9 +1,9 @@
 """Comix Uploader — desktop GUI.
 
 Search the site, pick a series once, and upload chapters without retyping
-URLs, folders, group names or title patterns. Cloudflare and comix's own
-security check are solved in the real Chrome window the app drives — the app
-watches the tabs and resumes on its own once a gate clears.
+URLs, folders, group names or title patterns. Cloudflare is cleared in the real
+Chrome window the app drives — the app watches the tabs and resumes on its own
+once it clears, or asks you to paste fresh cookies when it cannot.
 """
 
 from __future__ import annotations
@@ -16,7 +16,6 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from core import (
     MAX_CONCURRENCY,
-    WAF_CLEARANCE_MARGIN_SECONDS,
     ConfigStore,
     UploadParams,
     get_failed_file,
@@ -33,7 +32,6 @@ from core import (
     series_id_from_url,
     upload_url_for,
     upsert_series,
-    waf_clearance_seconds_left,
 )
 from session import BrowserSession
 
@@ -45,7 +43,7 @@ STATUS_COLORS = {
     "done": "#1a7f37",
     "failed": "#c0392b",
     "cloudflare": "#b45309",
-    "waf": "#b45309",
+    "aborted": "#c0392b",
 }
 
 # Events now arrive from the session thread AND one thread per parallel
@@ -499,6 +497,29 @@ class App(tk.Tk):
             card, text="Refresh Cloudflare", command=self.refresh_clearance, width=18
         ).pack(side="right")
 
+        # Cookie update row: when Cloudflare is stuck on "Verifying you are
+        # human" (or the login expired), refreshing no longer clears it — paste
+        # fresh cookies here instead of hand-editing config.json.
+        cookie_card = ttk.Frame(parent, style="Card.TFrame", padding=8)
+        cookie_card.pack(fill="x", pady=(0, 8))
+        ttk.Label(cookie_card, text="cf_clearance", style="Sub.TLabel").pack(
+            side="left"
+        )
+        self.cf_cookie_var = tk.StringVar()
+        self.cf_cookie_entry = ttk.Entry(
+            cookie_card, textvariable=self.cf_cookie_var
+        )
+        self.cf_cookie_entry.pack(side="left", fill="x", expand=True, padx=(4, 8))
+        ttk.Label(cookie_card, text="session", style="Sub.TLabel").pack(side="left")
+        self.session_cookie_var = tk.StringVar()
+        self.session_cookie_entry = ttk.Entry(
+            cookie_card, textvariable=self.session_cookie_var, width=18
+        )
+        self.session_cookie_entry.pack(side="left", padx=(4, 8))
+        ttk.Button(
+            cookie_card, text="Update cookies", command=self.update_cookies, width=16
+        ).pack(side="left")
+
         # Anchor the Cloudflare banner here so it always appears under the toolbar.
         self.cf_anchor = ttk.Frame(parent, height=0)
         self.cf_anchor.pack(fill="x")
@@ -521,26 +542,6 @@ class App(tk.Tk):
             command=self.restart_and_resume,
         ).pack(side="left", padx=4)
         ttk.Button(self.cf_frame, text="Stop run", command=self.stop_upload).pack(
-            side="left", padx=4
-        )
-
-        # Security-check banner: comix's own rotate-the-circle captcha. Same
-        # shape as the Cloudflare one, but there is no restart option because
-        # the clearance lives in the browser we already have open.
-        self.waf_frame = ttk.Frame(parent, style="Card.TFrame", padding=8)
-        self.waf_label = ttk.Label(
-            self.waf_frame,
-            text="",
-            foreground="#b45309",
-            font=("Segoe UI", 10, "bold"),
-        )
-        self.waf_label.pack(side="left")
-        ttk.Button(
-            self.waf_frame,
-            text="I solved it — resume now",
-            command=self.resume_after_waf,
-        ).pack(side="left", padx=8)
-        ttk.Button(self.waf_frame, text="Stop run", command=self.stop_upload).pack(
             side="left", padx=4
         )
 
@@ -674,32 +675,10 @@ class App(tk.Tk):
         query = self.search_var.get().strip()
         if not query:
             return
-        self._warn_if_waf_expiring()
         self.search_status.configure(text="Searching…")
         self.results.delete(0, "end")
         self.search_results = []
         self.session.submit(("search", query))
-
-    def _warn_if_waf_expiring(self, mention_missing: bool = False) -> None:
-        """Log-only heads-up before an action that may hit the security check."""
-        left = waf_clearance_seconds_left(self.config_store.data)
-        if left is None:
-            if mention_missing:
-                self.append_log(
-                    "[i] No saved security clearance — if comix's check "
-                    "appears, solve it once; it holds for about an hour."
-                )
-            return
-        if left > WAF_CLEARANCE_MARGIN_SECONDS:
-            return
-        if left <= 0:
-            state = "has expired"
-        else:
-            state = f"expires in ~{int(left // 60)} min"
-        self.append_log(
-            f"[i] Security clearance {state} — the security check will likely "
-            "appear. Solving it once holds for about an hour."
-        )
 
     def use_selected_result(self) -> None:
         if not self.search_results:
@@ -1074,11 +1053,24 @@ class App(tk.Tk):
         self.session.submit(("goto", upload_url_for(self.current_hid)))
 
     def refresh_clearance(self) -> None:
+        # Try the automatic solver first; fall back to the manual flow if it
+        # fails (handled in _on_cf_solve_failed).
+        self.append_log("[i] Solving Cloudflare automatically…")
+        self.session.submit(("solve_cf",))
+
+    def _manual_clearance_fallback(self) -> None:
         self.append_log(
             "[i] Opening Chrome — pass Cloudflare / log in, then come back."
         )
         self.session.submit(("restart",))
         self.session.submit(("save_cookies",))
+
+    def _on_cf_solve_failed(self, payload) -> None:
+        self.append_log(
+            "[!] Automatic Cloudflare solve failed — falling back to manual. "
+            "Clear the check in Chrome, or paste a fresh cf_clearance above."
+        )
+        self._manual_clearance_fallback()
 
     def start_upload(self) -> None:
         if self.run_active:
@@ -1116,7 +1108,6 @@ class App(tk.Tk):
         )
 
         self._persist_series_settings(folder=folder)
-        self._warn_if_waf_expiring(mention_missing=True)
         self._save_concurrency()
         self.total_queued = len(selected)
         self.active_chapters = set()
@@ -1173,22 +1164,20 @@ class App(tk.Tk):
         if self.cf_frame.winfo_manager():
             self.cf_frame.pack_forget()
 
-    def resume_after_waf(self) -> None:
-        self._hide_waf_banner()
-        self.session.submit(("resume_waf",))
-
-    def _show_waf_banner(self, chapter: str) -> None:
-        self.waf_label.configure(
-            text=(
-                f"Security check on chapter {chapter} — drag the circle in Chrome "
-                "until it lines up, then press Verify."
+    def update_cookies(self) -> None:
+        """Push the pasted cf_clearance/session into config.json + the browser."""
+        values = {
+            "cf_clearance": self.cf_cookie_var.get().strip(),
+            "session": self.session_cookie_var.get().strip(),
+        }
+        if not any(values.values()):
+            messagebox.showinfo(
+                "Nothing to update", "Paste a cf_clearance (or session) value first."
             )
-        )
-        self.waf_frame.pack(fill="x", pady=(0, 8), before=self.cf_anchor)
-
-    def _hide_waf_banner(self) -> None:
-        if self.waf_frame.winfo_manager():
-            self.waf_frame.pack_forget()
+            return
+        self.session.submit(("set_cookies", values))
+        self.cf_cookie_var.set("")
+        self.session_cookie_var.set("")
 
     # ------------------------------------------------------ worker events
 
@@ -1233,7 +1222,7 @@ class App(tk.Tk):
         does is tell the user how to proceed once they've solved it.
         """
         context, kind = payload
-        label = "Cloudflare challenge" if kind == "cloudflare" else "security check"
+        label = "Cloudflare challenge"
         if context == "search":
             self.search_status.configure(
                 text=f"Blocked by the {label} — solve it in Chrome, then search again"
@@ -1266,7 +1255,7 @@ class App(tk.Tk):
             data["selected"] = False
         if status == "uploading":
             self.active_chapters.add(key)
-        elif status in ("done", "failed", "pending"):
+        elif status in ("done", "failed", "pending", "aborted"):
             self.active_chapters.discard(key)
         if status == "done":
             self.done_count += 1
@@ -1309,23 +1298,31 @@ class App(tk.Tk):
             "doesn't (use the banner buttons)."
         )
 
-    def _on_waf(self, chapter) -> None:
-        self.run_label.configure(text="Waiting for the security check…")
-        self._show_waf_banner(chapter)
+    def _on_cloudflare_stuck(self, chapter) -> None:
+        self.run_label.configure(text="Cloudflare is stuck — update cookies")
+        self._hide_cf_banner()
         self.append_log(
-            "[!] comix security check — in the Chrome window, drag the circle "
-            "until the picture lines up and press Verify. "
-            "Uploading resumes automatically."
+            "[!] Cloudflare is stuck on 'Verifying you are human'. Refreshing "
+            "no longer clears it — paste a fresh cf_clearance in the cookie row "
+            "above and press 'Update cookies', then start again."
+        )
+        try:
+            self.cf_cookie_entry.focus_set()
+        except Exception:
+            pass
+        messagebox.showwarning(
+            "Cloudflare is stuck",
+            "Cloudflare is stuck on 'Verifying you are human'.\n\n"
+            "Get a fresh cf_clearance cookie from your browser and paste it "
+            "into the 'cf_clearance' field, then press 'Update cookies'.",
         )
 
     def _on_challenge_cleared(self, payload) -> None:
         kind, chapter = payload
-        label = "Cloudflare" if kind == "cloudflare" else "Security check"
         self._hide_cf_banner()
-        self._hide_waf_banner()
         self.run_label.configure(text="Resumed — uploading…")
         self.append_log(
-            f"[✓] {label} cleared on chapter {chapter} — resuming automatically."
+            f"[✓] Cloudflare cleared on chapter {chapter} — resuming automatically."
         )
 
     def _on_run_state(self, state) -> None:
@@ -1343,7 +1340,6 @@ class App(tk.Tk):
             self.pause_btn.configure(state="disabled", text="Pause")
             self.stop_btn.configure(state="disabled")
             self._hide_cf_banner()
-            self._hide_waf_banner()
 
     def _on_summary(self, summary) -> None:
         self.progress["value"] = self.progress["maximum"]
@@ -1352,6 +1348,12 @@ class App(tk.Tk):
             f"Processed: {summary.processed}   "
             f"Uploaded: {summary.succeeded}   Failed: {summary.failed}"
         )
+        if getattr(summary, "aborted", False):
+            self.append_log(
+                "[!] Server appears down — the batch was stopped. Nothing was "
+                "marked failed; try again once comix is back."
+                + (f" ({summary.abort_reason})" if summary.abort_reason else "")
+            )
         for ch, filename, err in summary.failures:
             self.append_log(f"  - Chapter {ch:g} ({filename}): {err}")
         self.run_label.configure(

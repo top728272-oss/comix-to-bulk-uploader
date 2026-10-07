@@ -17,14 +17,17 @@ from core import (
     Control,
     UploadParams,
     VerificationRequired,
+    apply_cookies_to_context,
     focus_challenge_window,
     launch_context,
     read_devtools_port,
     resolve_series_name,
     search_site,
+    set_config_cookies,
     sync_cookies_from_context,
 )
 from parallel import run_upload_batch_auto
+import solver
 
 
 class BrowserSession(threading.Thread):
@@ -71,10 +74,6 @@ class BrowserSession(threading.Thread):
         if kind == "restart_cf":
             self.control.restart_browser = True
             self.control.cf_event.set()
-            return
-        if kind == "resume_waf":
-            # Only nudges the wait loop; the browser is deliberately left alone.
-            self.control.waf_event.set()
             return
         self.jobs.put(job)
 
@@ -132,6 +131,40 @@ class BrowserSession(threading.Thread):
                     self.emit("log", "[i] Cookies unchanged.")
             return
 
+        if kind == "set_cookies":
+            # Manual cookie paste (e.g. a fresh cf_clearance when Cloudflare is
+            # stuck on "Verifying you are human"). Persist, reload, and inject
+            # into the live browser so the next attempt uses them.
+            values = job[1]
+            changed = set_config_cookies(self.config.data, values)
+            self.config.reload()
+            if self.context is not None:
+                apply_cookies_to_context(
+                    self.context, self.config.data.get("cookies", [])
+                )
+            self.emit(
+                "log",
+                "[✓] Cookies updated and applied."
+                if changed
+                else "[i] Cookies unchanged.",
+            )
+            return
+
+        if kind == "solve_cf":
+            # Auto-solve Cloudflare with the patchright solver. Runs on the
+            # session thread, so writing config.json here is allowed.
+            self.emit("log", "[i] Solving Cloudflare with the patchright solver…")
+            ok = solver.solve_into_config(self.config, self._log)
+            if ok:
+                if self.context is not None:
+                    apply_cookies_to_context(
+                        self.context, self.config.data.get("cookies", [])
+                    )
+                self.emit("log", "[✓] Cloudflare clearance ready.")
+            else:
+                self.emit("cf_solve_failed", None)
+            return
+
         if kind == "search":
             self._ensure_browser()
             query = job[1]
@@ -177,15 +210,12 @@ class BrowserSession(threading.Thread):
         like and simply retries the action afterwards.
         """
         what = "search" if context == "search" else "name lookup"
-        label = (
-            "Cloudflare challenge" if vreq.kind == "cloudflare" else "security check"
-        )
         self._log(
-            f"[!] The {label} blocked the {what}. Solve it in the Chrome "
-            f"window, then retry the {what} later."
+            f"[!] The Cloudflare challenge blocked the {what}. Clear it in the "
+            f"Chrome window, then retry the {what} later."
         )
         # Nothing else raises the window, so bring it forward here — otherwise
-        # the user is told to solve a puzzle they cannot see.
+        # the user is told to clear a check they cannot see.
         focus_challenge_window(self.page, self.config.data, self._log)
         self.emit("job_blocked", (context, vreq.kind))
 
@@ -257,20 +287,6 @@ class BrowserSession(threading.Thread):
                 sync_cookies_from_context(self.context, self.config.data)
         return self._ensure_page()
 
-    def _waf_resolved(self):
-        """Called once the user solves the security check.
-
-        Deliberately does NOT restart the browser: the clearance is tied to the
-        session we already have open, and relaunching would discard the puzzle
-        mid-solve. Just persist whatever cookies the challenge handed us.
-        """
-        if self.context is not None:
-            try:
-                sync_cookies_from_context(self.context, self.config.data)
-            except Exception:
-                pass
-        return self._ensure_page()
-
     def _ensure_page(self):
         """Keep the tracked page handle alive.
 
@@ -302,8 +318,8 @@ class BrowserSession(threading.Thread):
         def on_cloudflare(ch):
             self.emit("cloudflare", str(ch))
 
-        def on_waf(ch):
-            self.emit("waf", str(ch))
+        def on_cloudflare_stuck(ch):
+            self.emit("cloudflare_stuck", str(ch))
 
         def on_challenge_cleared(kind, ch):
             self.emit("challenge_cleared", (kind, str(ch)))
@@ -320,8 +336,10 @@ class BrowserSession(threading.Thread):
                 control=self.control,
                 on_cloudflare=on_cloudflare,
                 cf_resolved_hook=self._cf_resolved,
-                on_waf=on_waf,
-                waf_resolved_hook=self._waf_resolved,
+                on_cloudflare_stuck=on_cloudflare_stuck,
+                cf_solver_hook=solver.make_cf_solver_hook(
+                    self.config.data, self._log
+                ),
                 on_challenge_cleared=on_challenge_cleared,
                 max_retries=self.config.max_retries,
             )

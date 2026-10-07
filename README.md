@@ -19,6 +19,11 @@ pip install -r requirements.txt
 Google Chrome must be installed (the uploader drives your real Chrome profile
 so Cloudflare sees a normal browser).
 
+`requirements.txt` also installs **patchright**, a drop-in Playwright fork used
+only by the automatic Cloudflare solver. It drives your system Google Chrome
+(`channel="chrome"`), so no extra browser download is normally needed — if it
+ever complains, run `patchright install chrome` once.
+
 ---
 
 ## 2. Configuration Setup
@@ -41,7 +46,8 @@ Open `https://comix.to` in your browser, log in, and press `F12`:
    - Copy `remember_web_<HASH>` (full name + value), `session`, `cf_clearance`.
 
 After that you rarely need to touch `config.json` again — the app refreshes
-`cf_clearance` and `session` automatically from the browser profile.
+`cf_clearance` and `session` automatically, and **solves Cloudflare for you**
+(see §4).
 
 ---
 
@@ -67,9 +73,11 @@ Double-click **`Comix Uploader.bat`**, or run:
 | **Chapter table** | Shows pending / already uploaded / failed per chapter, with checkboxes so you can upload just a few. |
 | **Pause / Stop** | Stop lands after the current chapter; nothing is lost. |
 | **Cloudflare hand-off** | When a challenge hits, the app pauses, shows a banner, and **polls the tabs itself** — the check usually clears on its own and uploading resumes automatically. If it sits still the app reloads it, and if a full wait window (default 10 min) passes it restarts the browser once and waits one more window. **Resume now** / **Restart browser & resume** stay as manual overrides. The chapter is retried — never skipped, never marked failed. |
-| **Security check hand-off** | comix's own rotate-the-circle captcha (`/@waf/`). The app pauses, shows a banner, and **polls the tabs itself** — drag the circle until the picture lines up and press Verify; uploading resumes automatically with no button press needed. |
-| **Refresh Cloudflare** | One button restarts the browser session and re-saves cookies to `config.json`. |
-| **Stays out of your way** | Chrome no longer steals focus. The uploader works in the background and leaves the window wherever you put it (minimized or not). The only time it comes forward is when a Cloudflare check or security check actually needs you to look at it — and then it restores and focuses that window so the puzzle is right there. Both behaviours are toggleable in the options row. |
+| **Automatic Cloudflare solve** | When the check will not clear on its own, the app mints a fresh `cf_clearance` with **patchright** (a real, non-automated Chrome) and retries the chapter — no manual step. This is the fix for the "Verifying you are human" hang, which a Playwright-driven Chrome can never clear by itself. |
+| **Server-down stop** | If comix itself is down (502/503/521/522, connection refused), the app no longer mistakes it for a Cloudflare check. After a chapter's retries are exhausted the whole batch stops — nothing is marked failed, so you can just run it again once the site is back. |
+| **Cookie update (fallback)** | If the automatic solver fails, paste a fresh `cf_clearance` (and optionally `session`) into the cookie row and press **Update cookies** — no hand-editing `config.json`. |
+| **Refresh Cloudflare** | One button runs the automatic solver; if it fails, it falls back to restarting the browser session and re-saving cookies to `config.json`. |
+| **Stays out of your way** | Chrome no longer steals focus. The uploader works in the background and leaves the window wherever you put it (minimized or not). The only time it comes forward is when a Cloudflare check actually needs you to look at it — and then it restores and focuses that window. Both behaviours are toggleable in the options row. |
 
 ### Typical flow
 
@@ -78,52 +86,132 @@ Double-click **`Comix Uploader.bat`**, or run:
 3. Tick the chapters you want (pending ones are pre-ticked).
 4. **Start upload.**
 5. If Cloudflare pops up → nothing to do in most cases; it clears itself and
-   the upload resumes. If it doesn't, use the banner's **Resume now** /
-   **Restart browser & resume**.
-6. If the security check pops up → drag the circle in Chrome → press **Verify**
-   → it resumes by itself.
+   the upload resumes. If it doesn't, the app **solves it automatically** with
+   patchright and retries.
+6. Only if the automatic solver also fails: paste a fresh `cf_clearance` in the
+   cookie row → **Update cookies**, or use the banner's manual overrides.
+7. If the server is down → the batch stops by itself; run it again once comix
+   is back.
 
-Verification is still on you — the app just stops making you redo everything else.
+### Typical flow — no manual verification needed
+
+The whole point of the automatic solver is that steps 5–6 above normally never
+require you to touch anything.
 
 ---
 
 ## 4. Verification screens
 
-comix puts two different gates in front of you, and the app tells them apart:
+comix puts a Cloudflare check in front of you, and the app tells it apart from
+a dead server:
 
-|            | Cloudflare                                                                                                      | Security check (WAF)                                              |
-| ---------- | --------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
-| Looks like | "Just a moment…" / "Attention required"                                                                         | Dark card, _Verify you're human_, a circle you drag to rotate     |
-| Where      | `comix.to`                                                                                                      | `comix.to/@waf/challenge`                                         |
-| Fixed by   | Refreshing `cf_clearance`                                                                                       | Solving the puzzle in the open browser                            |
-| Recovery   | Automatic — polls every tab, reloads the check if it stalls, restarts the browser once after a full wait window | Automatic — the app polls until the challenge page navigates away |
-| Browser    | Restarted once if the check will not clear                                                                      | Never relaunched (that would discard the puzzle)                  |
+|            | Cloudflare check                                                             | Server down                                                                   |
+| ---------- | ---------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| Looks like | "Just a moment…" / "Attention required" / "Verifying you are human"          | Error 502/521/522, "Connection timed out"                                     |
+| Where      | `comix.to`                                                                   | Cloudflare's error page for a dead origin                                     |
+| Fixed by   | The automatic patchright solver (or a pasted cookie as fallback)             | Waiting for comix to come back                                                |
+| Recovery   | Wait → reload → restart once → **automatic solver** → retry; only then abort | After the chapter's retries fail, the batch **stops** — nothing marked failed |
+| Browser    | Restarted once if the check will not clear                                   | Never restarted                                                               |
 
-Both are detected on page load, before the upload form is touched, and again
+The check is detected on page load, before the upload form is touched, and again
 every second during an upload. A challenge that appears **mid-upload** pauses the
 run instead of losing it: the in-flight attempt is retried from scratch once the
-gate clears, and the chapter is never written to history while paused.
+check clears, and the chapter is never written to history while paused.
 
-If a gate keeps reappearing on the same chapter (default: 5 times), the app gives
-up on that one chapter rather than looping forever, and moves on.
+If a check keeps reappearing on the same chapter (default: 5 times), the app
+gives up on that one chapter rather than looping forever, and moves on.
+
+### How the automatic solver works
+
+A real Chrome driven by Playwright **cannot** clear Cloudflare: Playwright sends
+the CDP `Runtime.enable` command on attach, and the challenge page detects that
+automation-protocol signal — which is why the browser sits on "Verifying you are
+human" forever. So the app shells out to `solver.py`, which drives a **second**
+Chrome with **patchright** (a Playwright fork that avoids that signal), waits for
+the challenge to clear, and harvests `cf_clearance` (+ `__cf_bm`). Those cookies
+are injected into the uploader's own browser and the chapter is retried.
+
+Because `cf_clearance` is bound to the exact **User-Agent and IP**, both browsers
+must be the same Google Chrome on the same machine — they are, by default. The
+solver window starts off-screen (so it does not disrupt you) and is brought to
+the front only if the check needs a visible window.
+
+If the solver fails, the app falls back to the manual path: paste a fresh
+`cf_clearance` into the GUI's cookie row and press **Update cookies**, or use CLI
+menu option **[8] Paste Cloudflare cookies**. CLI option **[7]** still opens a
+real Chrome window for a normal refresh-and-login flow, and **[6]** runs the
+solver directly.
+
+### Blocked IPs (Cloudflare Error 1020) — not a challenge
+
+Sometimes comix answers with Cloudflare's **"Sorry, you have been blocked"**
+page instead of the upload form. That is a WAF **access-denied** decision, not a
+check, and the two behave nothing alike:
+
+- It is decided on the **IP and path** _before_ any cookie is read, so
+  `cf_clearance` is irrelevant and the solver cannot help.
+- It does not clear on its own, so waiting it out is pointless.
+- It can affect only some paths — typically `/user/upload/<hid>` — while
+  browsing still works, which is exactly what makes it look like a site bug.
+
+The app recognises it, reports the **Ray ID**, and stops the batch with
+_nothing recorded_, so the chapters are retried as soon as the egress IP
+changes. Fix it by switching network (a VPN is enough) or by setting `proxy`
+below.
+
+Scraped public proxy lists are **not** a solution. They are almost entirely
+datacenter IPs, which Cloudflare rates _worse_ than a home connection, most are
+dead or already listed, and a mid-run IP change invalidates the IP-bound
+clearance and strands half-uploaded chapters. Use your VPN's own local proxy
+(most VPNs expose `socks5://127.0.0.1:1080`) or a paid residential proxy with a
+**sticky** session — one stable IP per run is required.
+
+### Diagnosing a block
+
+`cf_diag.py` reports exactly what Cloudflare does to the current IP — HTTP
+status, `cf-ray` / `cf-mitigated` headers, the page title, the Ray ID, which
+detector matched, the egress IP, and the real User-Agent plus client hints:
+
+```bash
+python cf_diag.py --url https://comix.to/user/upload/<hid>
+```
+
+Run it once with the VPN off and once with it on, then compare. That is what
+distinguishes a hard IP block (needs a different egress) from a rate-limit rule
+(needs slower pacing). It is read-only and nothing in the uploader depends on it.
 
 ### Tunables (`config.json`)
 
 ```json
-"waf": {
-  "max_wait_seconds": 600,      // how long to wait for a gate to clear (both gates)
+"challenge": {
+  "max_wait_seconds": 600,      // how long to wait for the check to clear
   "poll_interval_seconds": 2,   // how often the tabs are re-checked
-  "max_pauses_per_chapter": 5   // give up on a chapter after this many gates
+  "max_pauses_per_chapter": 5   // give up on a chapter after this many checks
 },
-"concurrency": 5,                   // chapters uploading at once (1-8)
-"keep_window_in_background": true,  // never raise Chrome during normal work
-"focus_on_challenge": true          // restore + focus Chrome when a gate appears
+"cloudflare": {
+  "auto_solve": true,               // mint a clearance with patchright when stuck
+  "preflight_solve": false,         // solve once before a batch starts
+  "solve_max_wait_seconds": 90,     // how long the solver waits for the check
+  "solve_window_mode": "offscreen", // offscreen | focus | headless
+  "solve_focus_after_seconds": 15   // offscreen -> bring the window forward
+},
+"concurrency": 5,                    // chapters uploading at once (1-8)
+"timeout_seconds": 180,              // per-chapter "no chunk progress" budget
+"worker_stall_timeout_seconds": 180, // abandon a tab that stops making progress
+"keep_window_in_background": true,   // never raise Chrome during normal work
+"focus_on_challenge": true,          // restore + focus Chrome when a check appears
+"proxy": {
+  "server": "",                      // "" = connect directly; e.g. socks5://127.0.0.1:1080
+  "username": "",
+  "password": "",
+  "bypass": ""
+}
 ```
 
 `concurrency` is how many chapters upload **at the same time**, each in its own
 tab of the same Chrome window. `1` is the old strictly-one-at-a-time behaviour;
 the default is `5`. Because every tab belongs to the same browser, they share
-your login and the WAF clearance — one captcha solve still covers the whole
+your login and the Cloudflare clearance — one clearance covers the whole
 batch. Values above **8** (or anything that is not a whole number) are refused
 with a clear message when the app starts, so a typo cannot quietly halve or
 double your upload rate.
@@ -137,30 +225,81 @@ end instead), and the site has not been tested for parallel uploads to the
 _same_ series, so if you see server-side errors, drop `concurrency` to `2` or
 `1`.
 
+`timeout_seconds` is how long one chapter may go without a single chunk
+completing before it is treated as stalled and retried. It used to be **dead
+data** — nothing read it, so the value was always the hardcoded 90 s, which is
+too short when several 10-20 MB chapters upload at once over one uplink: the
+link saturates, no chunk finishes in time, and a perfectly good upload gets
+reported as _"Upload stalled: no chunk progress for 90s"_. It now works, and the
+default is 180.
+
+`worker_stall_timeout_seconds` is the safety net for a tab that stops
+responding. Playwright's `page.title()` / `page.content()` / `page.evaluate()`
+carry **no timeout at all**, so a wedged renderer used to block its worker — and
+therefore the whole batch — forever, with the chapter stuck on "uploading" and
+no error. Every check now reads the page through a call that _does_ have a
+deadline, and a worker that reports no progress for this long is abandoned by
+name (`Tab N stopped making progress on chapter X`) and its chapter handed to
+the sequential retry. Leave it unset and it is derived from `timeout_seconds`
+(`timeout_seconds + 60`, floor 180), so the watchdog can never fire on a chapter
+that is still inside its own stall window. A worker that is genuinely waiting
+keeps reporting heartbeats — from each chunk, each status change, and once per
+poll of the challenge wait and the upload loop — so only a truly wedged tab
+trips it.
+
+A worker tab that stops answering is replaced (it is probed twice first, so a
+merely busy renderer is not mistaken for a dead one), but only a few times per
+worker: the old tab **cannot be closed** — `Page.close()` takes no timeout, so
+closing a wedged tab is itself the call that would hang — and an uncapped
+replacement loop leaks a tab per chapter.
+
+Two guards stop one run from uploading the same chapter twice. The sequential
+tail re-checks the history before every chapter (the queue snapshot is taken
+once, so a parallel worker can finish a chapter after it), and a worker the
+watchdog abandoned is **told to stop** rather than being allowed to silently
+resume — a resumed worker would keep pulling chapters from the queue and upload
+them at the same time as the tail, which is how a chapter could end up uploaded
+twice and recorded as both done _and_ failed.
+
+`proxy` routes **both** the uploader and the Cloudflare solver through a proxy,
+which is the only real remedy for a WAF IP block (see above). Leave `server`
+empty to connect directly. Two constraints:
+
+- The solver must use the **same** proxy as the uploader — `cf_clearance` is
+  bound to the IP that earned it — so the setting is applied to both
+  automatically.
+- Chromium only sends proxy credentials for **HTTP(S)** proxies. SOCKS5
+  authentication is not supported (it fails with
+  `net::ERR_PROXY_AUTH_UNSUPPORTED`), so an authenticated SOCKS5 upstream needs
+  a local bridge — `gost`, `3proxy` or `privoxy` listening unauthenticated on
+  `127.0.0.1` — with `server` pointing at the bridge.
+
+The solver receives the proxy through its environment rather than its command
+line, so a password never shows up in the process list.
+
 `keep_window_in_background` is on by default: the app no longer calls
 `bring_to_front()` on any routine path, so Chrome keeps whatever state you left
 it in for the whole run. Set it to `false` only if you want to watch the
 upload happen, in which case Chrome is raised again at the start of each
 chapter.
 
-`focus_on_challenge` is the deliberate exception. The gates are unsolvable
-without a human looking at them, so when one is detected the app restores the
+`focus_on_challenge` is the deliberate exception. The check is unsolvable
+without a human looking at it, so when one is detected the app restores the
 window (un-minimizing it if needed) and brings it to the foreground. Once the
-gate clears the app leaves the window alone — it does not force it back down.
+check clears the app leaves the window alone — it does not force it back down.
 Windows only; on other platforms this is a no-op.
 
-`max_wait_seconds` applies to both gates. Cloudflare effectively gets two
+`max_wait_seconds` applies to the Cloudflare check. It effectively gets two
 windows: when the first expires, the browser is restarted once and the app
 waits one more window before stopping the run (the pending chapter is kept,
-nothing is marked failed). The security check never gets a browser restart —
-that would throw away the puzzle mid-solve.
+nothing is marked failed).
 
 ### When something unexpected shows up
 
-If a gate is hit that the app does not recognise, it dumps evidence to
-`.waf_debug/<timestamp>_<kind>/` — a screenshot, the page HTML, and a `meta.json`
-with the URL, title and frame list. That folder is enough to add a selector for a
-new challenge variant without reproducing it.
+If a challenge is hit that the app does not recognise, it dumps evidence to
+`.challenge_debug/<timestamp>_<kind>/` — a screenshot, the page HTML, and a
+`meta.json` with the URL, title and frame list. That folder is enough to add a
+selector for a new challenge variant without reproducing it.
 
 ---
 
@@ -185,11 +324,14 @@ Same engine, same history/retry behaviour, terminal prompts.
   older versions (`.upload_history_*.json` in the project root) are moved into
   `.history/` automatically the first time the app runs.
 - **Saved series + recent folders** live in `series_library.json`.
-- **Challenge evidence dumps** land in `.waf_debug/` (screenshots, page HTML,
-  `meta.json`) and are safe to delete.
+- **Challenge evidence dumps** land in `.challenge_debug/` (screenshots, page
+  HTML, `meta.json`) and are safe to delete.
 - The browser profile in `browser_profile/` keeps you logged in between runs.
-  Clearance for both gates lives there, so a solved security check usually
-  covers the rest of the run.
+  The Cloudflare clearance lives there too, so a fresh check usually covers the
+  rest of the run.
+- The solver keeps its own Chrome profile in `solver_profile/` (gitignored).
+  It is only used to mint `cf_clearance`, and it is safe to delete (the next
+  solve recreates it).
 
 ---
 
@@ -200,12 +342,15 @@ Same engine, same history/retry behaviour, terminal prompts.
 ```
 
 The suite needs no browser, no network and no Playwright account: `core.py` is
-stdlib-only by design and `parallel.py`'s browser plumbing is stubbed, so it
-runs in well under a second. It covers the config validation (including the
+stdlib-only by design, `solver.py`'s browser path is only exercised through its
+pure helpers, and `parallel.py`'s browser plumbing is stubbed, so it runs in
+well under a second. It covers the config validation (including the
 "concurrency too large" error), the upload engine's control flow — success,
 failure, skip-already-uploaded, stop, gate-cleared retry, gate-expiry, the
-parallel/sequential dispatch, the file-input attach and its fallbacks — and the
-history layout including the migration of pre-`.history/` files.
+Cloudflare solver hook, the server-down abort — the parallel/sequential
+dispatch, the file-input attach and its fallbacks, the solver's cookie/JSON
+helpers, and the history layout including the migration of pre-`.history/`
+files.
 
 ---
 
@@ -213,10 +358,11 @@ history layout including the migration of pre-`.history/` files.
 
 ```
 core.py      shared engine: config, chapter scanning, history, uploading, site search
+solver.py    automatic Cloudflare solver (patchright, runs as a subprocess)
 parallel.py  parallel upload engine (worker tabs attached to the same Chrome)
 session.py   background browser worker (persistent Chrome + job queue)
 gui.py       Tkinter desktop app
 uploader.py  command-line interface
-window_ctl.py Windows-only helper that focuses Chrome for a verification gate
+window_ctl.py Windows-only helper that focuses/moves Chrome for a verification gate
 tests/       stdlib unittest suite (no browser needed)
 ```

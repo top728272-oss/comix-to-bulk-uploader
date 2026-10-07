@@ -81,11 +81,13 @@ class PopupHandlerTestCase(unittest.TestCase):
         fire(worker_tab)
         self.assertFalse(worker_tab.closed)
 
-    def test_waf_challenge_tab_survives_even_with_opener(self):
+    def test_popup_with_opener_is_closed_regardless_of_url(self):
+        # The WAF tab exemption is gone with the WAF itself: any page with an
+        # opener is treated as a popup.
         main, fire = make_handler()
-        waf_tab = FakePage(url="https://comix.to/@waf/123", opener=main)
-        fire(waf_tab)
-        self.assertFalse(waf_tab.closed)
+        tab = FakePage(url="https://comix.to/@waf/123", opener=main)
+        fire(tab)
+        self.assertTrue(tab.closed)
 
     def test_main_page_is_never_closed(self):
         main, fire = make_handler()

@@ -25,21 +25,103 @@ SITE_ROOT = "https://comix.to"
 DEFAULT_CONCURRENCY = 5
 MAX_CONCURRENCY = 8
 
-# comix runs its own WAF next to Cloudflare: a rotate-the-circle captcha served
-# from /@waf/. It hijacks the tab (same tab, no popup) and redirects back to the
-# original URL by itself once solved, so "clearance" simply means "the challenge
-# page navigated away".
-WAF_PATH = "/@waf/"
-WAF_TITLE = "security check"
-WAF_SELECTORS = "#dragLayer, #angleReadout, #thumbBlock"
-WAF_DEBUG_DIR = BASE_DIR / ".waf_debug"
+# Cap on how long an HTTP 429 Retry-After is honoured before the chapter is
+# handed back to the retry loop. Kept well under the parallel stall watchdog
+# (worker_stall_timeout_seconds, default 180) so backing off cannot look like
+# a wedged tab.
+MAX_RATE_LIMIT_BACKOFF_SECONDS = 60.0
+
+# Per-chapter "no chunk progress" budget, in seconds.
+#
+# Configurable as "timeout_seconds". That key used to be dead data — nothing
+# read it, so the value was always the hardcoded 90 s. That is too short when
+# several 10-20 MB chapters upload at once over one uplink: the link saturates,
+# no chunk completes in time, and a perfectly good upload is reported as
+# "Upload stalled: no chunk progress for 90s".
+DEFAULT_IDLE_TIMEOUT = 180
+
+# Where evidence dumps (page HTML/screenshot) for an unfamiliar challenge land.
+# Deliberately a module global read at call time: tests monkeypatch it so a run
+# cannot litter the repo.
+CHALLENGE_DEBUG_DIR = BASE_DIR / ".challenge_debug"
 
 # Cookie names that can carry a challenge clearance worth persisting.
-CLEARANCE_COOKIE_HINTS = ("clearance", "waf", "challenge")
+CLEARANCE_COOKIE_HINTS = ("clearance", "challenge")
 
-# The WAF likes to re-challenge up to about a minute before waf_pass really
-# expires, so anything under this margin should be treated as "expect a check".
-WAF_CLEARANCE_MARGIN_SECONDS = 120
+# Cloudflare renders div#cf-wrapper on its ERROR pages too (502/521/522/...),
+# so that selector alone cannot tell a challenge from a dead origin. These
+# markers identify the error page so it is never mistaken for a challenge.
+#
+# NOTE: "ray id" also appears on the WAF *block* page below, so the block
+# detector must be consulted first (see is_cloudflare_error_page).
+CF_ERROR_MARKERS = (
+    ".cf-error-details",
+    "#cf-error-details",
+    "error 5",
+    "ray id",
+    "connection timed out",
+    "web server is down",
+    "webserver is down",
+    "origin is unreachable",
+    "hosting server",
+)
+
+# Cloudflare's WAF "access denied" page (Error 1020: "Sorry, you have been
+# blocked"). This is a HARD IP/path decision taken before any cookie is read,
+# so it is neither a solvable challenge (cf_clearance is irrelevant) nor an
+# origin outage. The only remedies are a different egress IP or slower pacing.
+CF_BLOCK_MARKERS = (
+    "you have been blocked",
+    "you are unable to access",
+    "error 1020",
+    "why have i been blocked",
+    "blocked by cloudflare",
+    "this website is using a security service",
+)
+
+# "Cloudflare Ray ID: <hex>" — the handle Cloudflare support needs, and the
+# only concrete evidence a block leaves behind.
+_RAY_ID_RE = re.compile(r"ray id\W{0,4}([0-9a-f]{8,})", re.I)
+
+# Cloudflare challenge-only markers (ported from Kotatsu-Redo's detector).
+# Safe to match anywhere: these never appear on a normal page.
+CF_CHALLENGE_MARKERS = (
+    "cf-browser-verification",
+    "cf-chl-opt",
+    "_cf_chl_opt",
+    "challenge-platform",
+)
+# Generic Turnstile markers. These CAN appear on a legitimate page (comix's own
+# login/upload widget), so they only count when no upload form is rendered.
+CF_TURNSTILE_MARKERS = (
+    "cf-turnstile",
+    "challenges.cloudflare.com",
+    "turnstile-wrapper",
+)
+
+# The "Verifying you are human" / stuck-turnstile state. A challenge page that
+# sits here past the grace window is never going to mint its own clearance by
+# refreshing — the user has to paste fresh cookies.
+CF_VERIFYING_MARKERS = (
+    "verifying you are human",
+    "verify you are human",
+    "check for human",
+    "checking your browser",
+)
+CF_VERIFYING_GRACE_SECONDS = 45.0
+
+# Low-level network failure strings (Playwright wraps them as "net::ERR_...").
+# A page that failed this way is a dead origin, not a challenge.
+SERVER_DOWN_MARKERS = (
+    "net::err_connection_refused",
+    "net::err_connection_timed_out",
+    "net::err_connection_closed",
+    "net::err_connection_reset",
+    "net::err_name_not_resolved",
+    "net::err_empty_response",
+    "connection refused",
+    "connection timed out",
+)
 
 # The upload form's file input. Used both as a Playwright locator and as a
 # plain CSS selector for the CDP file attach (see attach_upload_file).
@@ -72,15 +154,19 @@ FILE_PROBE_INSTALL_JS = """
 
 # "accepted" (the page got the file) | "empty" (input still there, no file) |
 # "gone" (the form consumed the input — typically means it took the file).
+#
+# Takes no argument: it is run through a locator handle (see _bounded_eval),
+# which calls the expression as ``(element, arg)`` — so the selector is inlined
+# here instead of being passed in.
 FILE_PROBE_STATE_JS = """
-(sel) => {
+() => {
   if (window.__comixFileProbe === 1) return 'accepted';
-  const input = document.querySelector(sel);
+  const input = document.querySelector(%s);
   if (!input) return 'gone';
   if (input.files && input.files.length > 0) return 'accepted';
   return 'empty';
 }
-"""
+""" % json.dumps(FILE_INPUT_SELECTOR)
 
 # How long to wait for the page to acknowledge the file.
 FILE_PROBE_POLL_TRIES = 10
@@ -90,10 +176,9 @@ FILE_PROBE_POLL_SECONDS = 0.2
 class VerificationRequired(Exception):
     """Raised when the site demands a human check before it will continue.
 
-    ``kind`` is either "cloudflare" (the standard interstitial) or "waf"
-    (comix's own /@waf/ rotate captcha). The two need different recovery: the
-    Cloudflare one is fixed by refreshing the cf_clearance cookie, the WAF one
-    by the user dragging the circle in the very browser we already have open.
+    ``kind`` is currently always "cloudflare" (the standard interstitial). The
+    clearance is fixed by refreshing the cf_clearance cookie; when refreshing
+    stops working the user has to paste fresh cookies.
     """
 
     def __init__(self, kind: str, message: str = "") -> None:
@@ -108,15 +193,32 @@ class CloudflareBlockException(VerificationRequired):
         super().__init__("cloudflare", message)
 
 
-class WafChallengeException(VerificationRequired):
-    """Raised when comix's /@waf/ rotate-captcha is detected."""
-
-    def __init__(self, message: str = "") -> None:
-        super().__init__("waf", message)
-
-
 class StopRequested(Exception):
     """Raised when the user aborts a running job."""
+
+
+class ServerDownError(Exception):
+    """Raised when the comix origin itself is unreachable (5xx / connection).
+
+    Deliberately distinct from a Cloudflare challenge: a dead origin fails
+    every chapter, so the batch is stopped instead of being retried as if a
+    human could clear it.
+    """
+
+
+class AccessBlockedError(VerificationRequired):
+    """Cloudflare's WAF blocked this IP on the upload path (Error 1020).
+
+    Distinct from both a challenge and a dead origin. No cookie can clear it —
+    it is an IP/path decision taken before ``cf_clearance`` is even read — so
+    the batch stops and the user is told to change the egress IP (or set
+    ``config.proxy``) rather than being sent to solve a captcha that is not
+    there. ``ray_id`` is carried so the block can be reported/queried.
+    """
+
+    def __init__(self, message: str = "", ray_id: str | None = None) -> None:
+        super().__init__("access_blocked", message)
+        self.ray_id = ray_id
 
 
 # --------------------------------------------------------------------------
@@ -206,51 +308,107 @@ def sync_cookies_from_context(context, config: dict) -> bool:
     return updated
 
 
-def waf_clearance_seconds_left(config: dict) -> float | None:
-    """Seconds left on the persisted waf_pass clearance, or None when unknown.
+def challenge_config(config: dict) -> dict:
+    """The "challenge" config block, with the legacy "waf" key still honoured.
 
-    The cookie value is "<unix-expiry>.<token>": the embedded timestamp is the
-    EXPIRY, not the mint time (mint + Max-Age of 3600, confirmed from a network
-    capture — a capture also showed the WAF re-challenging ~1 min early, hence
-    the margin constant above). None means "no cookie or unreadable"; callers
-    should stay silent in that case rather than guess.
+    The block used to be called "waf" (comix's own captcha) and also fed the
+    Cloudflare wait/poll timings. WAF is gone, so it is "challenge" now; old
+    config files keep working because "challenge" simply wins when both exist.
     """
-    for cookie in config.get("cookies", []):
-        if cookie.get("name") != "waf_pass":
+    merged = dict(config.get("waf") or {})
+    merged.update(config.get("challenge") or {})
+    return merged
+
+
+# Defaults for the automatic Cloudflare solver (see solver.py).
+CLOUDFLARE_DEFAULTS = {
+    "auto_solve": True,
+    "preflight_solve": False,
+    "solve_max_wait_seconds": 90,
+    "solve_window_mode": "offscreen",
+    "solve_focus_after_seconds": 15,
+}
+
+
+def cloudflare_config(config: dict) -> dict:
+    """The "cloudflare" config block merged over the defaults.
+
+    Tolerates a missing/partial block so older config files keep working.
+    """
+    merged = dict(CLOUDFLARE_DEFAULTS)
+    block = config.get("cloudflare") or {}
+    if isinstance(block, dict):
+        merged.update(block)
+    return merged
+
+
+def proxy_config(config: dict) -> dict | None:
+    """The "proxy" config block as Playwright's ``proxy`` dict, or None.
+
+    Shape: ``{"server": "socks5://127.0.0.1:1080", "username": "...", ...}``.
+    Empty fields are dropped so a partially filled block still works, and a
+    missing/blank block means "connect directly" (the default).
+
+    The same proxy MUST be given to the Cloudflare solver (see solver.py):
+    ``cf_clearance`` is bound to the UA *and IP* that earned it, so minting a
+    clearance from a different egress than the uploader's gets it rejected.
+
+    Chromium limitation worth knowing: ``username``/``password`` are only sent
+    for HTTP(S) proxies. SOCKS5 authentication is not supported by Chromium (it
+    fails with ``net::ERR_PROXY_AUTH_UNSUPPORTED``), so an *authenticated*
+    SOCKS5 upstream needs a local bridge (gost/3proxy/privoxy) listening
+    unauthenticated on 127.0.0.1, with ``server`` pointing at the bridge.
+    """
+    block = config.get("proxy") or {}
+    if not isinstance(block, dict):
+        return None
+    server = str(block.get("server") or "").strip()
+    if not server:
+        return None
+    proxy = {"server": server}
+    for key in ("username", "password", "bypass"):
+        value = block.get(key)
+        if value:
+            proxy[key] = str(value)
+    return proxy
+
+
+def set_config_cookies(config: dict, values: dict) -> bool:
+    """Update (or append) named cookies in ``config`` and save it.
+
+    ``values`` maps cookie name -> value; empty/None values are skipped so a
+    blank GUI field cannot wipe an existing cookie. Returns True when
+    something changed.
+    """
+    changed = False
+    by_name = {c.get("name"): c for c in config.setdefault("cookies", [])}
+    for name, value in values.items():
+        value = (value or "").strip()
+        if not value:
             continue
-        ts_part = str(cookie.get("value", "")).split(".", 1)[0]
-        try:
-            expiry = int(ts_part)
-        except (TypeError, ValueError):
-            return None
-        return expiry - time.time()
-    return None
+        if name in by_name:
+            if by_name[name].get("value") != value:
+                by_name[name]["value"] = value
+                changed = True
+        else:
+            config["cookies"].append(
+                {"name": name, "value": value, "url": SITE_ROOT}
+            )
+            changed = True
+    if changed:
+        save_config(config)
+    return changed
 
 
-def live_waf_pass_valid(context) -> bool:
-    """True when the LIVE browser session holds an unexpired waf_pass.
-
-    Unlike ``waf_clearance_seconds_left`` (which reads the persisted config),
-    this reads cookies straight from the open context, so a clearance minted
-    seconds ago in ANY tab of the shared browser counts. Parallel workers use
-    it to notice that another tab already solved the puzzle while their own
-    tab still shows the stale challenge page.
-    """
+def apply_cookies_to_context(context, cookies: list) -> bool:
+    """Inject cookies into a live browser context (best-effort, never raises)."""
+    if context is None or not cookies:
+        return False
     try:
-        cookies = context.cookies() or []
+        context.add_cookies(cookies)
+        return True
     except Exception:
         return False
-    for cookie in cookies:
-        if cookie.get("name") != "waf_pass":
-            continue
-        ts_part = str(cookie.get("value", "")).split(".", 1)[0]
-        try:
-            expiry = int(ts_part)
-        except (TypeError, ValueError):
-            continue
-        if expiry - time.time() > WAF_CLEARANCE_MARGIN_SECONDS:
-            return True
-    return False
 
 
 class ConfigStore:
@@ -683,6 +841,11 @@ class HistoryRecorder:
 
     def record_failure(self, ch_num, err: str | None) -> None:
         with self._lock:
+            # Never contradict a recorded success. A duplicate or stale attempt
+            # failing after the chapter already uploaded used to leave the same
+            # chapter in BOTH the history and the failed list.
+            if str(ch_num) in self.history:
+                return
             self.failed_history[str(ch_num)] = err or "Unknown error"
             save_failed(self.failed_file, self.failed_history)
 
@@ -709,7 +872,7 @@ def launch_context(
 
     ``enable_cdp`` adds a local DevTools endpoint (random port) so parallel
     upload workers can attach to this same browser from their own threads —
-    they then share the profile, the login and the WAF clearance cookie.
+    they then share the profile, the login and the Cloudflare clearance cookie.
     """
     args = [
         "--disable-blink-features=AutomationControlled",
@@ -726,6 +889,9 @@ def launch_context(
         args=args,
         ignore_default_args=["--enable-automation"],
         viewport={"width": 1280, "height": 900},
+        # None means "connect directly". When set, the solver must use the same
+        # egress or the clearance it mints is bound to the wrong IP.
+        proxy=proxy_config(config),
     )
 
     page = context.pages[0] if context.pages else context.new_page()
@@ -739,7 +905,7 @@ def launch_context(
 
 
 def install_popup_handler(context, page, config: dict) -> None:
-    """Auto-close popups on ``context``, except the WAF challenge tab.
+    """Auto-close popups on ``context``.
 
     Extracted from launch_context so parallel workers can guard the pages
     they create on their own CDP connection.
@@ -758,10 +924,6 @@ def install_popup_handler(context, page, config: dict) -> None:
         if new_page == page:
             return
         try:
-            # The security check must be left alone — closing it would throw
-            # away the puzzle the user is about to solve.
-            if WAF_PATH in (new_page.url or ""):
-                return
             # No opener => opened programmatically (a parallel worker's tab,
             # or our own), not by the page. Never close those.
             if new_page.opener() is None:
@@ -794,55 +956,220 @@ def read_devtools_port(timeout: float = 5.0) -> int | None:
     return None
 
 
-def is_cloudflare_active(page) -> bool:
+# Every DOM read that feeds a *decision* must carry a deadline.
+#
+# ``page.title()``, ``page.content()`` and ``page.evaluate()`` are sent with NO
+# timeout at all (verified in the driver: ``kNoTimeout`` == ``{timeout: 0}``),
+# so a tab whose renderer has wedged blocks the calling thread FOREVER — no
+# exception, no log, and in parallel mode the whole batch with it. Locator
+# actions DO carry a driver-side deadline, so they raise TimeoutError even when
+# the renderer never replies. Route every detector through these.
+SAFE_READ_TIMEOUT_MS = 1500
+
+
+def _safe_title(page, timeout_ms: int = SAFE_READ_TIMEOUT_MS) -> str:
+    """The tab's ``<title>``, bounded. Empty string when unreadable/wedged."""
     try:
-        title = page.title().strip().lower()
-        if (
-            title.startswith("just a moment")
-            or "attention required! | cloudflare" in title
-        ):
-            return True
-        if page.locator(
-            "#challenge-stage, #challenge-running, div#cf-wrapper"
-        ).first.is_visible():
-            return True
+        return (
+            page.locator("title").first.text_content(timeout=timeout_ms) or ""
+        ).strip()
     except Exception:
-        pass
-    return False
+        return ""
 
 
-def is_waf_challenge(page) -> bool:
-    """True while the tab sits on comix's /@waf/ rotate-the-circle captcha.
+def _safe_html(
+    page, timeout_ms: int = SAFE_READ_TIMEOUT_MS, lower: bool = True
+) -> str:
+    """The tab's document HTML, bounded. Empty string when unreadable/wedged.
 
-    Three independent signals, because the URL is the only one guaranteed to be
-    correct the instant the navigation commits, while the DOM hooks only exist
-    once the challenge page has rendered.
+    Reads ``<html>`` rather than ``<body>`` because the Cloudflare markers live
+    in ``<head>``/``<script>`` as often as in the body.
     """
+    try:
+        html = page.locator("html").first.inner_html(timeout=timeout_ms) or ""
+    except Exception:
+        return ""
+    return html.lower() if lower else html
+
+
+def _safe_visible(page, selector: str, timeout_ms: int = SAFE_READ_TIMEOUT_MS) -> bool:
+    """Bounded element-visibility check. False when absent OR unreadable."""
+    try:
+        return bool(page.locator(selector).first.is_visible(timeout=timeout_ms))
+    except Exception:
+        return False
+
+
+def _bounded_eval(
+    page, expression: str, arg=None, timeout_ms: int = SAFE_READ_TIMEOUT_MS
+):
+    """``page.evaluate`` with a deadline.
+
+    ``page.evaluate`` carries no timeout, so a wedged renderer blocks it
+    forever. A locator's ``evaluate`` does have a driver-side deadline, so the
+    call is routed through a handle on ``<html>`` (always present). The
+    expression is invoked as ``expression(element, arg)`` — write it as a
+    no-arg arrow, or accept the element as its first parameter.
+    """
+    return page.locator("html").first.evaluate(expression, arg, timeout=timeout_ms)
+
+
+def _page_text(page, timeout_ms: int = 1000) -> str:
+    """Best-effort lowercased body text; empty string when unreadable."""
+    try:
+        return (page.locator("body").inner_text(timeout=timeout_ms) or "").lower()
+    except Exception:
+        return ""
+
+
+def page_is_responsive(page, timeout_ms: int = 2000) -> bool:
+    """False when the tab's renderer does not answer a bounded read.
+
+    This is the tab-liveness probe: a wedged renderer is exactly what makes a
+    worker hang forever, so it is checked before a chapter is handed to a tab
+    (parallel.py) and while scanning the other tabs during a challenge wait.
+    An ``about:blank`` tab IS responsive — only a *failed* read counts as dead.
+
+    Deliberately a ``get_attribute`` round-trip rather than an ``inner_html``
+    read: it proves the renderer answered without serialising the whole
+    document, which matters when this runs once per tab per poll.
+    """
+    if page is None:
+        return False
     try:
         if page.is_closed():
             return False
-        if WAF_PATH in (page.url or ""):
-            return True
-        if (page.title() or "").strip().lower() == WAF_TITLE:
-            return True
-        if page.locator(WAF_SELECTORS).first.is_visible():
-            return True
     except Exception:
-        pass
-    return False
+        return False
+    try:
+        page.locator("html").first.get_attribute("lang", timeout=timeout_ms)
+        return True
+    except Exception:
+        return False
+
+
+def is_cloudflare_access_block(page) -> bool:
+    """True on Cloudflare's WAF "access denied" page (Error 1020).
+
+    "Sorry, you have been blocked / You are unable to access <host>". A hard
+    IP-or-path decision taken before any cookie is read: no ``cf_clearance``
+    can clear it, and it is NOT an origin outage either. Callers must stop and
+    change the egress IP (or pace the run) instead of waiting or re-solving.
+    """
+    text = _safe_title(page).lower() + " " + _page_text(page)
+    return any(marker in text for marker in CF_BLOCK_MARKERS)
+
+
+def cloudflare_ray_id(page) -> str | None:
+    """The "Cloudflare Ray ID: <hex>" token on the current page, if any.
+
+    Present on both the WAF block page and CF error pages — the only concrete
+    handle for reporting a block.
+    """
+    haystack = _safe_title(page) + " " + _page_text(page)
+    match = _RAY_ID_RE.search(haystack)
+    return match.group(1) if match else None
+
+
+def is_cloudflare_error_page(page) -> bool:
+    """True when the tab is a Cloudflare *error* page (origin down), not a check.
+
+    Cloudflare serves its 5xx error pages with the same ``div#cf-wrapper`` a
+    challenge uses, so this must be tested before the challenge detector —
+    otherwise a dead origin is misread as "solve the captcha".
+
+    The WAF block page (Error 1020) also carries a Ray ID, so it is excluded
+    explicitly: misreading a block as "origin down" sends the user chasing the
+    wrong problem.
+    """
+    if _safe_visible(page, ".cf-error-details, #cf-error-details"):
+        if not is_cloudflare_access_block(page):
+            return True
+    text = _safe_title(page).lower() + " " + _page_text(page)
+    if is_cloudflare_access_block(page):
+        return False
+    return any(marker in text for marker in CF_ERROR_MARKERS)
+
+
+def _looks_like_upload_form(page) -> bool:
+    """True when the real comix upload form is rendered on this tab.
+
+    Used to keep the generic Turnstile markers from flagging comix's own
+    Turnstile widget on a page we are successfully using.
+    """
+    return _safe_visible(page, ".upage-field, input.upage-drop__input")
+
+
+def is_cloudflare_active(page) -> bool:
+    """True while a real Cloudflare interstitial is showing.
+
+    Deliberately NOT matching bare ``div#cf-wrapper``: Cloudflare error pages
+    (502/521/522/...) render that wrapper too, and treating an origin outage
+    as a solvable challenge is what made the uploader loop forever.
+
+    A WAF *block* page is excluded as well. It shares the "Attention Required!
+    | Cloudflare" title with a challenge, but nothing can clear it — reporting
+    it as a challenge sends the user to wait out / solve a gate that is not
+    there, instead of telling them the IP is blocked.
+    """
+    if is_cloudflare_access_block(page):
+        return False
+    if is_cloudflare_error_page(page):
+        return False
+    title = _safe_title(page).lower()
+    if title.startswith("just a moment") or "attention required! | cloudflare" in title:
+        return True
+    if _safe_visible(page, "#challenge-stage, #challenge-running, #turnstile-wrapper"):
+        return True
+    # Challenge-only markers (safe anywhere). The document HTML is scanned too,
+    # not just the body text, because these live in <head>/<script> — that is
+    # what replaces the old page.evaluate("!!window._cf_chl_opt") probe, which
+    # had no timeout at all.
+    text = _page_text(page)
+    if any(marker in text for marker in CF_CHALLENGE_MARKERS):
+        return True
+    # Generic Turnstile markers: only when this is not a working upload form.
+    if _looks_like_upload_form(page):
+        return False
+    haystack = text + " " + _safe_html(page)
+    return any(marker in haystack for marker in CF_TURNSTILE_MARKERS)
+
+
+def is_cloudflare_verifying(page) -> bool:
+    """True while a Cloudflare page sits on the "Verifying you are human" step.
+
+    This state no longer clears on its own (or on a refresh), so the wait loop
+    uses it to give up early and ask the user for fresh cookies instead of
+    spinning for the whole window.
+    """
+    text = _safe_title(page).lower() + " " + _page_text(page)
+    return any(marker in text for marker in CF_VERIFYING_MARKERS)
 
 
 def detect_challenge(page) -> str | None:
-    """Return "cloudflare", "waf", or None for the tab's current state."""
-    if is_cloudflare_active(page):
-        return "cloudflare"
-    if is_waf_challenge(page):
-        return "waf"
-    return None
+    """Return "cloudflare" or None for the tab's current state."""
+    return "cloudflare" if is_cloudflare_active(page) else None
 
 
 def _kind_label(kind: str) -> str:
-    return "Security check" if kind == "waf" else "Cloudflare challenge"
+    if kind == "access_blocked":
+        return "Cloudflare access block"
+    return "Cloudflare challenge"
+
+
+def _looks_like_server_down(page, exc_text: str) -> bool:
+    """True when a failure means the origin is down rather than a challenge.
+
+    Combines the exception text (Playwright surfaces connection failures as
+    ``net::ERR_...`` strings) with the page itself (a Cloudflare error page).
+    """
+    text = (exc_text or "").lower()
+    if any(marker in text for marker in SERVER_DOWN_MARKERS):
+        return True
+    try:
+        return is_cloudflare_error_page(page)
+    except Exception:
+        return False
 
 
 # --------------------------------------------------------------------------
@@ -902,9 +1229,9 @@ def _focus_for_challenge(page, challenged, log: Callable) -> None:
 
 
 def _exception_for(kind: str, message: str = "") -> VerificationRequired:
-    if kind == "waf":
-        return WafChallengeException(message or "Security check is active.")
-    return CloudflareBlockException(message or "Cloudflare challenge screen is active.")
+    return CloudflareBlockException(
+        message or "Cloudflare challenge screen is active."
+    )
 
 
 def require_no_challenge(page, message: str = "") -> None:
@@ -919,6 +1246,25 @@ def require_no_cloudflare(
 ) -> None:
     """Kept for back-compat; require_no_challenge is the general form."""
     require_no_challenge(page, message)
+
+
+def _raise_if_access_blocked(page) -> None:
+    """Raise AccessBlockedError when Cloudflare's WAF block page is showing.
+
+    Separate from ``require_no_challenge`` because a block is not a gate: there
+    is nothing to wait out and no cookie to refresh. The message has to say so,
+    or the user is sent to solve a captcha that does not exist.
+    """
+    if not is_cloudflare_access_block(page):
+        return
+    ray = cloudflare_ray_id(page)
+    raise AccessBlockedError(
+        "Cloudflare blocked this IP on the upload path"
+        + (f" (Ray ID {ray})" if ray else "")
+        + ". No cookie can clear a WAF block — switch network (VPN) or set "
+        "config.proxy, then retry.",
+        ray_id=ray,
+    )
 
 
 def _confirm_block(page, grace: float = 3.0) -> bool:
@@ -945,7 +1291,7 @@ def save_challenge_evidence(
     possible moment (a page we do not understand, possibly mid-navigation).
     """
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    folder = WAF_DEBUG_DIR / f"{stamp}_{kind}"
+    folder = CHALLENGE_DEBUG_DIR / f"{stamp}_{kind}"
     try:
         folder.mkdir(parents=True, exist_ok=True)
     except Exception:
@@ -959,10 +1305,12 @@ def save_challenge_evidence(
         "title": None,
         "frames": [],
     }
+    html = _safe_html(page, lower=False)
     try:
         meta["url"] = page.url
-        meta["title"] = page.title()
+        meta["title"] = _safe_title(page)
         meta["frames"] = [f.url for f in page.frames]
+        meta["ray_id"] = cloudflare_ray_id(page)
     except Exception:
         pass
     if tracker:
@@ -972,7 +1320,7 @@ def save_challenge_evidence(
             pass
 
     for name, write in (
-        ("page.html", lambda p: p.write_text(page.content(), encoding="utf-8")),
+        ("page.html", lambda p: p.write_text(html, encoding="utf-8")),
         (
             "meta.json",
             lambda p: p.write_text(json.dumps(meta, indent=2), encoding="utf-8"),
@@ -982,10 +1330,13 @@ def save_challenge_evidence(
             write(folder / name)
         except Exception:
             pass
-    try:
-        page.screenshot(path=str(folder / "screenshot.png"), full_page=True)
-    except Exception:
-        pass
+    # Only when the bounded read actually succeeded: screenshot() has no
+    # timeout either, so on a wedged tab it would block the dump.
+    if html:
+        try:
+            page.screenshot(path=str(folder / "screenshot.png"), full_page=True)
+        except Exception:
+            pass
 
     return folder
 
@@ -1014,13 +1365,15 @@ def _page_ready_after_challenge(page) -> bool:
 
     Kept deliberately loose: the gate detectors above decide what counts as a
     challenge, this only stops a blank tab or a 502 corpse from being read as
-    "the challenge is gone".
+    "the challenge is gone". The bounded body read *completing* is what proves
+    the renderer answered — the old ``document.readyState`` evaluate had no
+    timeout, so it could hang forever on a wedged tab.
     """
     try:
         if (page.url or "").strip() in ("", "about:blank"):
             return False
-        title = page.title().strip().lower()
-        body = page.locator("body").inner_text(timeout=1000).strip().lower()
+        title = _safe_title(page).lower()
+        body = _page_text(page)
         errors = (
             "bad gateway",
             "gateway time-out",
@@ -1030,10 +1383,7 @@ def _page_ready_after_challenge(page) -> bool:
         )
         if any(marker in title or marker in body for marker in errors):
             return False
-        return bool(body) and page.evaluate("document.readyState") in (
-            "interactive",
-            "complete",
-        )
+        return bool(body)
     except Exception:
         return False
 
@@ -1051,10 +1401,32 @@ def _pump_browser(page, duration: float) -> None:
     time.sleep(duration)
 
 
+def _tab_gate_state(page) -> dict:
+    """One bounded snapshot of a tab's gate state.
+
+    ``readable`` is False when the tab did not answer a bounded read at all.
+    The wait loop treats that as "cannot be judged" instead of blocking on it,
+    so one wedged tab can no longer stall every worker's challenge wait.
+    """
+    if not page_is_responsive(page):
+        return {
+            "readable": False,
+            "challenged": False,
+            "verifying": False,
+            "ready": False,
+        }
+    challenged = is_cloudflare_active(page)
+    return {
+        "readable": True,
+        "challenged": challenged,
+        "verifying": challenged and is_cloudflare_verifying(page),
+        "ready": (not challenged) and _page_ready_after_challenge(page),
+    }
+
+
 def wait_for_challenge_clear(
     page,
     control: Control | None = None,
-    kind: str = "waf",
     log: Callable = print,
     max_wait: int = 600,
     poll: float = 2.0,
@@ -1062,34 +1434,41 @@ def wait_for_challenge_clear(
     cf_reload_after: float = 30.0,
     cf_reload_every: float = 15.0,
     focus: bool = True,
+    stuck_grace: float = CF_VERIFYING_GRACE_SECONDS,
+    on_heartbeat: Callable | None = None,
 ) -> bool:
-    """Block until the gate is gone from every tab, or the wait window expires.
+    """Block until the Cloudflare gate is gone from every tab, or the window expires.
 
-    The human does the solving in the visible Chrome window; all this does is
-    notice it and say so. Polls every tab on the site, not just the tracked
-    page: the /@waf/ hijack is free to move the challenge to another tab, and
-    a clearance nobody is watching never ends the wait. A read only counts as
-    clean once every tab shows real content — a blank or 502 page is not
-    "cleared", it is just another thing to wait out. ``settle`` consecutive
-    clean reads are required so a mid-redirect sample cannot end the wait
-    early. ``kind`` also decides how pushy the wait is: "waf" never touches
-    the page (reloading would reset the puzzle), while "cloudflare" reloads
-    the check when it sits still — a stalled check never mints its clearance,
-    and the fresh visit is what produces it.
+    The human does the clearing in the visible Chrome window (or pastes fresh
+    cookies); all this does is notice it and say so. Polls every tab on the
+    site, not just the tracked page: a clearance nobody is watching never ends
+    the wait. A read only counts as clean once every tab shows real content — a
+    blank or 502 page is not "cleared", it is just another thing to wait out.
+    ``settle`` consecutive clean reads are required so a mid-redirect sample
+    cannot end the wait early.
+
+    A check that sits on "Verifying you are human" past ``stuck_grace`` is not
+    going to clear on its own (refreshing no longer solves it), so the wait
+    gives up early and raises ``control.cf_stuck_event`` for the caller to ask
+    the user for fresh cookies. Otherwise a stalled check is reloaded — the
+    fresh visit is what mints a clearance.
+
+    ``on_heartbeat`` (optional) is called once per poll while the wait is still
+    progressing. A parallel worker uses it to prove to the stall watchdog that
+    its tab is alive-but-waiting rather than wedged.
     """
-    check = is_waf_challenge if kind == "waf" else is_cloudflare_active
-    manual = None
-    if control is not None:
-        manual = control.waf_event if kind == "waf" else control.cf_event
+    manual = control.cf_event if control is not None else None
 
     deadline = time.time() + max_wait
     clean = 0
     challenge_since: float | None = None
+    verifying_since: float | None = None
     last_reload = 0.0
+    warned_unreadable = False
 
     while time.time() < deadline:
         if control is not None:
-            if control.stopped:
+            if control.stopped or control.aborted:
                 return False
             if control.pause_event.is_set():
                 time.sleep(0.25)
@@ -1105,24 +1484,52 @@ def wait_for_challenge_clear(
             # to reload; hold here so the retry surfaces the real problem.
             clean = 0
         else:
-            challenged = [p for p in pages if check(p)]
+            # One bounded probe per tab per poll. Every read carries a deadline,
+            # so a wedged renderer surfaces as "unreadable" instead of blocking
+            # this loop (and, in parallel mode, every worker in it).
+            states = {p: _tab_gate_state(p) for p in pages}
+            unreadable = [p for p, st in states.items() if not st["readable"]]
+            if unreadable and not warned_unreadable:
+                warned_unreadable = True
+                log(
+                    f"[i] {len(unreadable)} tab(s) stopped answering during the "
+                    "challenge wait — ignoring them so the wait can still finish."
+                )
+            challenged = [p for p, st in states.items() if st["challenged"]]
             if challenged:
                 clean = 0
                 now = time.time()
                 if challenge_since is None:
                     challenge_since = now
-                    # First sighting of this gate: surface the window so the
-                    # puzzle is actually solvable. Fires once per episode.
+                    # First sighting of this gate: surface the window so it is
+                    # actually solvable. Fires once per episode.
                     if focus:
                         _focus_for_challenge(page, challenged, log)
-                elif (
-                    kind == "cloudflare"
-                    and now - challenge_since > cf_reload_after
+
+                if any(states[p]["verifying"] for p in challenged):
+                    if verifying_since is None:
+                        verifying_since = now
+                    elif now - verifying_since > stuck_grace:
+                        # Refreshing no longer clears this state — hand it to
+                        # the user instead of spinning out the whole window.
+                        log(
+                            "[!] Cloudflare is stuck on 'Verifying you are "
+                            "human'. Refreshing no longer clears it — paste a "
+                            "fresh cf_clearance cookie and try again."
+                        )
+                        if control is not None:
+                            control.cf_stuck_event.set()
+                        return False
+                else:
+                    verifying_since = None
+
+                if (
+                    now - challenge_since > cf_reload_after
                     and now - last_reload > cf_reload_every
                 ):
-                    # A Cloudflare check that just spins (or dies with a 502)
-                    # never finishes on its own; reload the stuck tab. Prefer
-                    # the tracked page so the retry lands on a live tab.
+                    # A check that just spins never finishes on its own; reload
+                    # the stuck tab. Prefer the tracked page so the retry lands
+                    # on a live tab.
                     target = next((p for p in challenged if p == page), challenged[0])
                     try:
                         log("[i] The Cloudflare check seems stuck — reloading it.")
@@ -1132,21 +1539,30 @@ def wait_for_challenge_clear(
                     last_reload = time.time()
                     challenge_since = time.time()
             elif pages and all(
-                not detect_challenge(p) and _page_ready_after_challenge(p)
-                for p in pages
+                st["ready"] for st in states.values() if st["readable"]
             ):
                 challenge_since = None
+                verifying_since = None
                 clean += 1
                 if clean >= settle:
                     return True
             else:
                 challenge_since = None
+                verifying_since = None
                 clean = 0
+
+        if on_heartbeat is not None:
+            try:
+                on_heartbeat()
+            except Exception:
+                pass
 
         slept = 0.0
         while slept < poll:
             if control is not None and (
-                control.stopped or (manual is not None and manual.is_set())
+                control.stopped
+                or control.aborted
+                or (manual is not None and manual.is_set())
             ):
                 break
             # Pump Playwright's dispatcher while sleeping: page.url only
@@ -1180,7 +1596,7 @@ def search_site(page, query: str, limit: int = 15, log: Callable | None = None):
 
     toggle = page.locator("button.search-toggle").first
     try:
-        if toggle.is_visible():
+        if toggle.is_visible(timeout=SAFE_READ_TIMEOUT_MS):
             toggle.click(timeout=2000)
             page.wait_for_timeout(300)
     except Exception:
@@ -1209,6 +1625,10 @@ def search_site(page, query: str, limit: int = 15, log: Callable | None = None):
             )
     page.wait_for_timeout(600)
 
+    # The one remaining un-bounded read in the codebase, and deliberately so:
+    # Page.eval_on_selector_all takes no timeout (and neither does Locator's
+    # eval_all), it runs only on the read-only search path, and it is preceded
+    # by a 10 s wait_for_selector that already proves the renderer is answering.
     raw = page.eval_on_selector_all(
         ".search-pop__item--result",
         """els => els.map(e => {
@@ -1265,7 +1685,7 @@ def resolve_series_name(page, hid: str, log: Callable | None = None) -> str:
     require_no_challenge(
         page, "A verification screen blocked the site while resolving the title."
     )
-    title = (page.title() or "").strip()
+    title = _safe_title(page)
     title = re.sub(r"\s*[-|]\s*Comix.*$", "", title, flags=re.IGNORECASE).strip()
     if log:
         log(f"Resolved {hid} -> {title or '(unknown)'}")
@@ -1299,7 +1719,13 @@ class Control:
     stop_event: threading.Event = field(default_factory=threading.Event)
     pause_event: threading.Event = field(default_factory=threading.Event)
     cf_event: threading.Event = field(default_factory=threading.Event)
-    waf_event: threading.Event = field(default_factory=threading.Event)
+    # Set when Cloudflare is stuck on "Verifying you are human" and needs the
+    # user to paste fresh cookies; cleared by the caller after it reacts.
+    cf_stuck_event: threading.Event = field(default_factory=threading.Event)
+    # Set when the batch must stop because the origin is down (or Cloudflare
+    # cannot be cleared). Distinct from a user stop.
+    abort_event: threading.Event = field(default_factory=threading.Event)
+    abort_reason: str = ""
     restart_browser: bool = False
     # Off by default: draining a queue is not a reason to steal the desktop.
     # Only a verification challenge is (see focus_challenge_window).
@@ -1309,18 +1735,29 @@ class Control:
         self.stop_event.clear()
         self.pause_event.clear()
         self.cf_event.clear()
-        self.waf_event.clear()
+        self.cf_stuck_event.clear()
+        self.abort_event.clear()
+        self.abort_reason = ""
         self.restart_browser = False
 
     def request_stop(self) -> None:
         self.stop_event.set()
         self.pause_event.clear()
         self.cf_event.set()
-        self.waf_event.set()
+
+    def request_abort(self, reason: str = "") -> None:
+        """Stop the batch because of an infrastructure failure, not a user stop."""
+        if reason:
+            self.abort_reason = reason
+        self.abort_event.set()
 
     @property
     def stopped(self) -> bool:
         return self.stop_event.is_set()
+
+    @property
+    def aborted(self) -> bool:
+        return self.abort_event.is_set()
 
 
 def attach_upload_file(page, file_input, file_path, log: Callable = print) -> None:
@@ -1369,7 +1806,7 @@ def _attach_via_cdp(page, file_path, log: Callable) -> bool:
     session = None
     try:
         try:
-            page.evaluate(FILE_PROBE_INSTALL_JS)
+            _bounded_eval(page, FILE_PROBE_INSTALL_JS)
         except Exception:
             pass  # probing is best-effort; the input check below still works
 
@@ -1393,7 +1830,7 @@ def _attach_via_cdp(page, file_path, log: Callable) -> bool:
         gone_reads = 0
         state = ""
         for _ in range(FILE_PROBE_POLL_TRIES):
-            state = page.evaluate(FILE_PROBE_STATE_JS, FILE_INPUT_SELECTOR)
+            state = _bounded_eval(page, FILE_PROBE_STATE_JS)
             if state == "accepted":
                 return True
             if state == "gone":
@@ -1435,11 +1872,13 @@ def _fill_group(
     for _attempt in range(1, 4):
         picked_el = page.locator(".upage-group--picked")
         try:
-            if picked_el.is_visible():
-                if group_name.lower() in picked_el.inner_text().lower():
+            if picked_el.is_visible(timeout=SAFE_READ_TIMEOUT_MS):
+                if group_name.lower() in picked_el.inner_text(
+                    timeout=SAFE_READ_TIMEOUT_MS
+                ).lower():
                     return
                 clear_btn = page.locator(".upage-group__clear")
-                if clear_btn.is_visible():
+                if clear_btn.is_visible(timeout=SAFE_READ_TIMEOUT_MS):
                     clear_btn.click(force=True)
                     page.wait_for_timeout(500)
         except Exception:
@@ -1450,9 +1889,10 @@ def _fill_group(
             # foreground, so the raise is opt-in only.
             if allow_raise:
                 page.bring_to_front()
-            page.evaluate(
+            _bounded_eval(
+                page,
                 '() => document.querySelectorAll(\'a[href="#"][target="_blank"]\')'
-                ".forEach(e => e.remove())"
+                ".forEach(e => e.remove())",
             )
             group_input.click(force=True)
             group_input.fill("")
@@ -1471,28 +1911,62 @@ def _fill_group(
                 group_item.dispatch_event("click")
 
             picked_el.wait_for(state="visible", timeout=4000)
-            if group_name.lower() in picked_el.inner_text().lower():
+            if group_name.lower() in picked_el.inner_text(
+                timeout=SAFE_READ_TIMEOUT_MS
+            ).lower():
                 log(f"[✓] Group '{group_name}' selected.")
                 return
         except Exception:
             page.wait_for_timeout(1000)
 
-    page.evaluate(
-        """(name) => {
+    # Runs through a locator handle, so the expression receives the element
+    # first and the group name second.
+    try:
+        _bounded_eval(
+            page,
+            """(_el, name) => {
             const btns = Array.from(document.querySelectorAll('button.upage-group__item'));
             const match = btns.find(b => b.textContent.toLowerCase().includes(name));
             if (match) match.click();
         }""",
-        group_name.lower(),
-    )
+            group_name.lower(),
+        )
+    except Exception:
+        pass
     page.wait_for_timeout(1000)
     try:
-        if page.locator(".upage-group--picked").is_visible():
+        if page.locator(".upage-group--picked").is_visible(
+            timeout=SAFE_READ_TIMEOUT_MS
+        ):
             log(f"[✓] Group '{group_name}' selected via DOM fallback.")
             return
     except Exception:
         pass
     log(f"[!] Warning: group '{group_name}' was not confirmed picked.")
+
+
+def _retry_after_seconds(res) -> float | None:
+    """``Retry-After`` off a response, in seconds. None when absent/unparsable.
+
+    Accepts both forms the header allows: a delay in seconds, or an HTTP-date.
+    """
+    try:
+        raw = (res.headers or {}).get("retry-after")
+    except Exception:
+        return None
+    if not raw:
+        return None
+    raw = str(raw).strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+
+        return max(0.0, parsedate_to_datetime(raw).timestamp() - time.time())
+    except Exception:
+        return None
 
 
 def upload_single_chapter(
@@ -1503,12 +1977,19 @@ def upload_single_chapter(
     file_path,
     group_name: str,
     mark_official: bool,
-    idle_timeout: int = 90,
+    idle_timeout: int = DEFAULT_IDLE_TIMEOUT,
     log: Callable = print,
     on_chunk=None,
+    on_heartbeat=None,
     control: Control | None = None,
 ):
-    """Upload one chapter. Returns (success, error). Raises CloudflareBlockException."""
+    """Upload one chapter. Returns (success, error).
+
+    Raises CloudflareBlockException when a challenge hijacks the upload, and
+    ServerDownError when the origin itself is failing (5xx / connection loss).
+    ``on_heartbeat`` is called once per poll iteration so the parallel stall
+    watchdog can tell a slow-but-alive upload from a wedged tab.
+    """
 
     def check_stop():
         if control is not None and control.stopped:
@@ -1523,6 +2004,10 @@ def upload_single_chapter(
     page.wait_for_timeout(1000)
     check_stop()
     require_no_challenge(page)
+    # A WAF block renders a real page that simply has no upload form, so it is
+    # caught here — before the form wait below, which would otherwise fail with
+    # a bare timeout and get misread as "the origin is down".
+    _raise_if_access_blocked(page)
 
     try:
         page.wait_for_selector(".upage-field input", timeout=15000)
@@ -1532,6 +2017,7 @@ def upload_single_chapter(
             raise _exception_for(
                 kind, "A verification screen blocked the upload form."
             ) from ex
+        _raise_if_access_blocked(page)
         raise
 
     page.wait_for_timeout(500)
@@ -1579,9 +2065,10 @@ def upload_single_chapter(
         "finalized": False,
         "error": None,
         "blocked": False,
-        "waf_suspect": False,
+        "server_down": False,
         "last_activity": time.time(),
         "chunks_done": 0,
+        "retry_after": None,
     }
 
     def on_response(res):
@@ -1591,11 +2078,6 @@ def upload_single_chapter(
             tracker["chunks_done"] += 1
             if on_chunk:
                 on_chunk(tracker["chunks_done"])
-        elif WAF_PATH in res_url:
-            # The challenge itself is loading. Record it, but never raise from
-            # inside the handler — the DOM check in the polling loop decides.
-            tracker["last_activity"] = time.time()
-            tracker["waf_suspect"] = True
         elif "/api/v1/uploads" in res_url:
             tracker["last_activity"] = time.time()
             if "finalize" in res_url and res.status == 200:
@@ -1603,8 +2085,16 @@ def upload_single_chapter(
             elif res.status in (403, 503):
                 tracker["blocked"] = True
                 tracker["error"] = f"Upload API blocked (HTTP {res.status})"
-            elif res.status in (429, 500, 502, 503, 504):
+            elif res.status in (500, 502, 503, 504):
+                # The origin is failing, not the account — remember it so the
+                # chapter is treated as server-down, not as a challenge.
+                tracker["server_down"] = True
                 tracker["error"] = f"HTTP {res.status} on {res_url}"
+            elif res.status == 429:
+                tracker["error"] = f"HTTP {res.status} on {res_url}"
+                # A rate-limit rule. Remember Retry-After so the retry backs
+                # off instead of re-tripping the limit immediately.
+                tracker["retry_after"] = _retry_after_seconds(res)
 
     page.on("response", on_response)
 
@@ -1619,19 +2109,23 @@ def upload_single_chapter(
         while True:
             check_stop()
 
+            # A WAF block replaces the upload page with an access-denied page.
+            # Checked before the success test below because the block page is
+            # not under /user/upload/ — the URL test would otherwise report the
+            # chapter as uploaded even though nothing was sent.
+            _raise_if_access_blocked(page)
+
             # A challenge can hijack the tab mid-upload. This has to run BEFORE
-            # the success check below: the /@waf/ page is not under /user/upload/,
-            # so testing the URL first would report the chapter as uploaded and
-            # write it to history even though nothing was submitted.
+            # the success check below: a challenge page is not under
+            # /user/upload/, so testing the URL first would report the chapter
+            # as uploaded and write it to history even though nothing was sent.
             kind = detect_challenge(page)
             if kind:
                 raise _exception_for(
                     kind, f"{_kind_label(kind)} interrupted the upload."
                 )
 
-            if tracker["finalized"] or (
-                "/user/upload/" not in page.url and WAF_PATH not in page.url
-            ):
+            if tracker["finalized"] or "/user/upload/" not in page.url:
                 log(
                     f"[✓] Chapter {chapter_num:g} uploaded "
                     f"({tracker['chunks_done']} chunks)."
@@ -1646,10 +2140,30 @@ def upload_single_chapter(
                     raise _exception_for(
                         kind, f"{_kind_label(kind)} triggered on the upload API."
                     )
+                if tracker.get("server_down"):
+                    raise ServerDownError(tracker["error"])
                 log(f"[!] Server error: {tracker['error']}")
                 return False, tracker["error"]
 
             if tracker["error"]:
+                if tracker.get("server_down"):
+                    raise ServerDownError(tracker["error"])
+                delay = tracker.get("retry_after")
+                if delay:
+                    # A rate-limit rule answered. Wait it out before handing the
+                    # chapter back, so the retry does not immediately re-trip
+                    # the limit that caused it.
+                    delay = min(float(delay), MAX_RATE_LIMIT_BACKOFF_SECONDS)
+                    log(
+                        f"[!] Rate limited (HTTP 429) — waiting {delay:.0f}s "
+                        "before retrying."
+                    )
+                    waited = 0.0
+                    while waited < delay:
+                        if control is not None and control.stopped:
+                            raise StopRequested()
+                        page.wait_for_timeout(500)
+                        waited += 0.5
                 log(f"[!] Server error: {tracker['error']}")
                 return False, tracker["error"]
 
@@ -1657,8 +2171,8 @@ def upload_single_chapter(
                 ".alert-danger, .error-message, .toast-error, div[role='alert']"
             ).first
             try:
-                if error_el.is_visible():
-                    err_text = error_el.inner_text().strip()
+                if error_el.is_visible(timeout=SAFE_READ_TIMEOUT_MS):
+                    err_text = error_el.inner_text(timeout=SAFE_READ_TIMEOUT_MS).strip()
                     log(f"[!] UI error: {err_text}")
                     return False, err_text
             except Exception:
@@ -1674,6 +2188,15 @@ def upload_single_chapter(
                 log(f"[!] {err}")
                 return False, err
 
+            # Still polling, so this worker's tab is alive — tell the stall
+            # watchdog, or a big upload that is merely slow would be mistaken
+            # for a wedged tab.
+            if on_heartbeat is not None:
+                try:
+                    on_heartbeat()
+                except Exception:
+                    pass
+
             page.wait_for_timeout(1000)
     finally:
         try:
@@ -1688,6 +2211,10 @@ class RunSummary:
     succeeded: int = 0
     failed: int = 0
     failures: list = field(default_factory=list)
+    # Set when the batch stopped early because the origin was down (or
+    # Cloudflare could not be cleared) — distinct from a user stop.
+    aborted: bool = False
+    abort_reason: str = ""
 
 
 @dataclass
@@ -1705,22 +2232,27 @@ class ChapterContext:
     log: Callable = print
     on_status: Callable | None = None
     on_chunk: Callable | None = None
+    # Parallel mode only: called by the challenge wait once per poll so the
+    # stall watchdog can tell "alive but waiting" apart from "wedged".
+    on_heartbeat: Callable | None = None
     control: Control | None = None
     max_retries: int = 3
-    idle_timeout: int = 90
-    waf_max_wait: int = 600
-    waf_poll: float = 2.0
+    idle_timeout: int = DEFAULT_IDLE_TIMEOUT
+    challenge_max_wait: int = 600
+    challenge_poll: float = 2.0
     max_pauses: int = 5
     focus: bool = True
     on_cloudflare: Callable | None = None
-    on_waf: Callable | None = None
+    on_cloudflare_stuck: Callable | None = None
     on_challenge_cleared: Callable | None = None
     cf_resolved_hook: Callable | None = None
-    waf_resolved_hook: Callable | None = None
-    # Parallel mode only: never restart the shared browser, and use the
-    # supplied sliced WAF wait (it also watches the live waf_pass cookie).
+    # Automatic Cloudflare solver: called as ``hook(context, log) -> bool`` with
+    # the page's OWN context (thread-affine — a worker passes its own context,
+    # the sequential engine passes the session's). Must NOT write config.json
+    # when called from a worker thread.
+    cf_solver_hook: Callable | None = None
+    # Parallel mode only: never restart the shared browser.
     allow_restart: bool = True
-    waf_wait_fn: Callable | None = None
     recorder: HistoryRecorder | None = None
     # Deliberately on the context, not in the retry loop: the challenge path
     # re-enters that loop, which would reset per-chapter/per-run state and let
@@ -1733,18 +2265,25 @@ def build_chapter_context(
     config: dict, params: UploadParams, **overrides
 ) -> ChapterContext:
     """ChapterContext from config + params, with per-run defaults applied."""
-    waf_cfg = config.get("waf") or {}
+    challenge_cfg = challenge_config(config)
     kwargs = dict(
         config=config,
         params=params,
-        waf_max_wait=int(waf_cfg.get("max_wait_seconds", 600)),
-        waf_poll=float(waf_cfg.get("poll_interval_seconds", 2)),
-        max_pauses=int(waf_cfg.get("max_pauses_per_chapter", 5)),
+        challenge_max_wait=int(challenge_cfg.get("max_wait_seconds", 600)),
+        challenge_poll=float(challenge_cfg.get("poll_interval_seconds", 2)),
+        max_pauses=int(challenge_cfg.get("max_pauses_per_chapter", 5)),
         focus=bool(config.get("focus_on_challenge", True)),
         allow_restart=True,
         recorder=HistoryRecorder(params.url),
+        idle_timeout=int(config.get("timeout_seconds", DEFAULT_IDLE_TIMEOUT)),
     )
     kwargs.update(overrides)
+    # A caller that does not care about the idle timeout passes None; fall back
+    # to the configured value rather than storing None.
+    if kwargs.get("idle_timeout") is None:
+        kwargs["idle_timeout"] = int(
+            config.get("timeout_seconds", DEFAULT_IDLE_TIMEOUT)
+        )
     return ChapterContext(**kwargs)
 
 
@@ -1774,6 +2313,8 @@ def _process_chapter(page, ch_num, file_path, ctx: ChapterContext):
     * ``"pending"`` — not completed and NOT recorded: the user stopped the run,
       or a gate outlasted its wait window. The caller stops (sequential) or
       hands the chapter to the sequential fallback (parallel).
+    * ``"aborted"`` — the origin appears down (or Cloudflare is stuck). The
+      batch stops; nothing is recorded, so the chapter is retried next run.
 
     The returned page may differ from the input one — the Cloudflare recovery
     path can restart the browser (sequential mode only).
@@ -1788,7 +2329,8 @@ def _process_chapter(page, ch_num, file_path, ctx: ChapterContext):
         success = False
         last_err = None
         challenge_hit = False
-        challenge_kind = None
+        server_down = False
+        access_blocked = False
 
         if ctx.on_status:
             ctx.on_status(ch_num, "uploading", "")
@@ -1820,6 +2362,7 @@ def _process_chapter(page, ch_num, file_path, ctx: ChapterContext):
                     on_chunk=(lambda c, n=ch_num: ctx.on_chunk(n, c))
                     if ctx.on_chunk
                     else None,
+                    on_heartbeat=ctx.on_heartbeat,
                     control=control,
                 )
                 if success:
@@ -1829,10 +2372,26 @@ def _process_chapter(page, ch_num, file_path, ctx: ChapterContext):
                 if ctx.on_status:
                     ctx.on_status(ch_num, "pending", "")
                 return "pending", None, page
+            except ServerDownError as ex:
+                # The origin is failing, not the account. Let the retry loop
+                # run it out; if it never succeeds the batch is aborted.
+                server_down = True
+                last_err = str(ex)
+                log(f"[!] Server error on ch. {ch_num:g}: {ex}")
+            except AccessBlockedError as ex:
+                # A WAF block is decided per-IP, so every remaining chapter will
+                # hit it. Stop the batch with an actionable reason and record
+                # nothing, so the chapters are retried once the egress IP
+                # changes (VPN, or config.proxy). Deliberately ahead of the
+                # VerificationRequired handler below — this is not a gate.
+                log(f"\n[!] {_kind_label(ex.kind)}: {ex}")
+                if ctx.on_status:
+                    ctx.on_status(ch_num, "aborted", str(ex))
+                control.request_abort(str(ex))
+                return "aborted", str(ex), page
             except VerificationRequired as vreq:
                 log(f"\n[!] {_kind_label(vreq.kind)}: {vreq}")
                 challenge_hit = True
-                challenge_kind = vreq.kind
                 last_err = str(vreq)
                 break
             except Exception as ex:
@@ -1841,15 +2400,53 @@ def _process_chapter(page, ch_num, file_path, ctx: ChapterContext):
                 if kind:
                     log(f"[!] {_kind_label(kind)} detected.")
                     challenge_hit = True
-                    challenge_kind = kind
                     break
-                log(f"[!] Error on ch. {ch_num:g}: {ex}")
+                if is_cloudflare_access_block(page):
+                    # A failure on a blocked page is the block, not the origin.
+                    access_blocked = True
+                    log(f"[!] {_kind_label('access_blocked')} on ch. {ch_num:g}: {ex}")
+                elif _looks_like_server_down(page, str(ex)):
+                    server_down = True
+                    log(f"[!] Server error on ch. {ch_num:g}: {ex}")
+                else:
+                    log(f"[!] Error on ch. {ch_num:g}: {ex}")
 
         if control.stopped:
             if ctx.on_status:
                 ctx.on_status(ch_num, "pending", "")
             log("[!] Stopped by user.")
             return "pending", None, page
+
+        if control.aborted:
+            return "aborted", control.abort_reason, page
+
+        if access_blocked and not success:
+            ray = cloudflare_ray_id(page)
+            reason = (
+                "Cloudflare blocked this IP on the upload path"
+                + (f" (Ray ID {ray})" if ray else "")
+                + ". No cookie can clear a WAF block — switch network (VPN) or "
+                "set config.proxy, then retry."
+            )
+            log(
+                "[!] Cloudflare blocked this IP on the upload path — stopping "
+                "the batch; nothing was recorded."
+            )
+            if ctx.on_status:
+                ctx.on_status(ch_num, "aborted", reason)
+            control.request_abort(reason)
+            return "aborted", reason, page
+
+        if server_down and not success and not challenge_hit:
+            reason = last_err or "comix server appears down"
+            log(
+                "[!] Server appears down — stopping the batch so nothing else "
+                "is attempted."
+            )
+            if ctx.on_status:
+                ctx.on_status(ch_num, "aborted", reason)
+            control.request_abort(reason)
+            return "aborted", reason, page
 
         if challenge_hit:
             key = str(ch_num)
@@ -1862,108 +2459,96 @@ def _process_chapter(page, ch_num, file_path, ctx: ChapterContext):
                 )
                 last_err = "Repeated verification screens"
                 challenge_hit = False
-            elif challenge_kind == "waf":
-                # comix's own captcha: the user drags the circle in the Chrome
-                # window we already have open, so the context must stay alive —
-                # relaunching it would throw the puzzle away. A leftover
-                # confirmation click (this run or an earlier pause) must not
-                # end the wait before the puzzle is solved, and a click that
-                # races ahead of this pause must not be discarded — so the
-                # event is cleared before the pause is announced.
-                control.waf_event.clear()
-                if ctx.on_status:
-                    ctx.on_status(ch_num, "waf", "solve the security check")
-                if ctx.on_waf:
-                    ctx.on_waf(ch_num)
-                # One dump per run is plenty to identify the challenge, and it
-                # keeps a recurring gate from filling the disk.
-                evidence = None
-                if not ctx.dumped:
-                    evidence = save_challenge_evidence(page, "waf", chapter=ch_num)
-                    ctx.dumped = True
-                log(
-                    "\n"
-                    + "=" * 60
-                    + "\n  [!] SECURITY CHECK — comix wants you to verify you're human"
-                    + "\n"
-                    + "=" * 60
-                    + f"\nPaused on chapter {ch_num:g}. Nothing was skipped or marked failed."
-                    + "\nIn the Chrome window, drag the circle until the picture lines up,"
-                    + "\nthen press Verify. Uploading resumes on its own."
-                    + (f"\nEvidence saved to {evidence}" if evidence else "")
-                )
-                if ctx.waf_wait_fn is not None:
-                    # Parallel workers slice this wait and also watch the live
-                    # waf_pass cookie — another tab may have solved the puzzle.
-                    cleared = ctx.waf_wait_fn(page, control, log)
-                else:
-                    cleared = wait_for_challenge_clear(
-                        page,
-                        control=control,
-                        kind="waf",
-                        log=log,
-                        max_wait=ctx.waf_max_wait,
-                        poll=ctx.waf_poll,
-                        focus=ctx.focus,
-                    )
-                if control.stopped:
-                    if ctx.on_status:
-                        ctx.on_status(ch_num, "pending", "")
-                    log("[!] Stopped by user.")
-                    return "pending", None, page
-                if not cleared:
-                    log(
-                        "[!] The security check was not cleared in time. "
-                        "Stopping here so nothing is skipped or marked failed."
-                    )
-                    if ctx.on_status:
-                        ctx.on_status(ch_num, "pending", "")
-                    return "pending", None, page
-                if ctx.waf_resolved_hook is not None:
-                    try:
-                        page = ctx.waf_resolved_hook() or page
-                    except Exception as ex:
-                        log(f"[!] Could not re-sync the browser session: {ex}")
-                        if ctx.on_status:
-                            ctx.on_status(ch_num, "pending", "")
-                        return "pending", None, page
-                log(f"[✓] Security check cleared. Resuming chapter {ch_num:g}.")
-                if ctx.on_challenge_cleared is not None:
-                    try:
-                        ctx.on_challenge_cleared("waf", ch_num)
-                    except Exception as ex:
-                        log(f"[!] Cleared callback failed: {ex}")
-                continue  # retry the same chapter
             else:
-                # Cloudflare: comix's check is non-interactive — a normal visit
+                # Cloudflare: the check is non-interactive — a normal visit
                 # mints the clearance — so waiting it out beats waiting for a
-                # click. The resume buttons stay as manual overrides. As with
-                # the security check, the event is cleared before the pause is
-                # announced so a racing confirmation click survives.
+                # click. The resume buttons stay as manual overrides, and the
+                # event is cleared before the pause is announced so a racing
+                # confirmation click survives.
                 control.cf_event.clear()
                 if ctx.on_status:
                     ctx.on_status(ch_num, "cloudflare", "waiting for clearance")
                 if ctx.on_cloudflare:
                     ctx.on_cloudflare(ch_num)
+                # One dump per run: enough to identify an unfamiliar challenge,
+                # and it keeps a recurring one from filling the disk.
+                if not ctx.dumped:
+                    evidence = save_challenge_evidence(
+                        page, "cloudflare", chapter=ch_num
+                    )
+                    ctx.dumped = True
+                    if evidence:
+                        log(f"[i] Challenge evidence saved to {evidence}")
                 cleared = wait_for_challenge_clear(
                     page,
                     control=control,
-                    kind="cloudflare",
                     log=log,
-                    max_wait=ctx.waf_max_wait,
-                    poll=ctx.waf_poll,
+                    max_wait=ctx.challenge_max_wait,
+                    poll=ctx.challenge_poll,
                     focus=ctx.focus,
+                    on_heartbeat=ctx.on_heartbeat,
                 )
                 if control.stopped:
                     if ctx.on_status:
                         ctx.on_status(ch_num, "pending", "")
                     log("[!] Stopped by user.")
                     return "pending", None, page
+
+                stuck = control.cf_stuck_event.is_set()
+                if (stuck or not cleared) and ctx.cf_solver_hook is not None:
+                    # The check is not clearing by itself. Mint a fresh
+                    # cf_clearance with the patchright solver and retry.
+                    if stuck:
+                        control.cf_stuck_event.clear()
+                    log("[i] Cloudflare is not clearing on its own — running the solver…")
+                    if ctx.on_status:
+                        ctx.on_status(ch_num, "cloudflare", "solving…")
+                    solved = False
+                    try:
+                        solved = bool(ctx.cf_solver_hook(page.context, log))
+                    except Exception as ex:
+                        log(f"[!] Cloudflare solver failed: {ex}")
+                    if control.stopped:
+                        if ctx.on_status:
+                            ctx.on_status(ch_num, "pending", "")
+                        return "pending", None, page
+                    if solved:
+                        log(
+                            f"[✓] Solver obtained a fresh clearance. "
+                            f"Resuming chapter {ch_num:g}."
+                        )
+                        if ctx.on_challenge_cleared is not None:
+                            try:
+                                ctx.on_challenge_cleared("cloudflare", ch_num)
+                            except Exception as ex:
+                                log(f"[!] Cleared callback failed: {ex}")
+                        continue
+                    if stuck:
+                        # Restore the flag so the existing abort path below fires.
+                        control.cf_stuck_event.set()
+
+                if control.cf_stuck_event.is_set():
+                    # Refreshing no longer clears it — ask for fresh cookies.
+                    control.cf_stuck_event.clear()
+                    reason = (
+                        "Cloudflare stuck on 'Verifying you are human' — "
+                        "paste a fresh cf_clearance cookie"
+                    )
+                    if ctx.on_cloudflare_stuck:
+                        try:
+                            ctx.on_cloudflare_stuck(ch_num)
+                        except Exception as ex:
+                            log(f"[!] Stuck callback failed: {ex}")
+                    if ctx.on_status:
+                        ctx.on_status(ch_num, "aborted", reason)
+                    control.request_abort(reason)
+                    return "aborted", reason, page
                 if not cleared:
-                    if not ctx.allow_restart:
-                        # Parallel mode: restarting the shared browser would
-                        # kill every other worker's upload mid-flight, so the
-                        # chapter is handed back instead.
+                    if not ctx.allow_restart or ctx.cf_resolved_hook is None:
+                        # Parallel mode (restarting the shared browser would
+                        # kill every other worker's upload), or no relaunch hook
+                        # wired at all: hand the chapter back instead of
+                        # spinning or pretending the check cleared.
                         log(
                             "[!] Cloudflare did not clear in time. Leaving this "
                             "chapter for a sequential retry."
@@ -2010,11 +2595,11 @@ def _process_chapter(page, ch_num, file_path, ctx: ChapterContext):
                         cleared = wait_for_challenge_clear(
                             page,
                             control=control,
-                            kind="cloudflare",
                             log=log,
-                            max_wait=ctx.waf_max_wait,
-                            poll=ctx.waf_poll,
+                            max_wait=ctx.challenge_max_wait,
+                            poll=ctx.challenge_poll,
                             focus=ctx.focus,
+                            on_heartbeat=ctx.on_heartbeat,
                         )
                         if control.stopped:
                             if ctx.on_status:
@@ -2059,6 +2644,10 @@ def _process_chapter(page, ch_num, file_path, ctx: ChapterContext):
             ctx.on_status(ch_num, "done", "")
         return "done", None, page
 
+    if control.aborted:
+        # Another worker (or an earlier chapter) decided the batch is over.
+        return "aborted", control.abort_reason, page
+
     recorder.record_failure(ch_num, last_err)
     log(f"[X] Chapter {ch_num:g} failed: {last_err}")
     if ctx.on_status:
@@ -2076,17 +2665,20 @@ def run_upload_batch(
     control: Control | None = None,
     on_cloudflare=None,  # (chapter_num) -> called when CF pause begins
     cf_resolved_hook=None,  # (restart_requested) -> page  (lets the caller relaunch)
-    on_waf=None,  # (chapter_num) -> called when the WAF pause begins
-    waf_resolved_hook=None,  # () -> page  (re-sync only; never relaunch)
+    on_cloudflare_stuck=None,  # (chapter_num) -> CF stuck on "Verifying"
+    cf_solver_hook=None,  # (context, log) -> bool  (auto-solve Cloudflare)
     on_challenge_cleared=None,  # (kind, chapter_num) -> a gate cleared itself
     max_retries: int = 3,
-    idle_timeout: int = 90,
+    idle_timeout: int | None = None,
 ) -> RunSummary:
     """Upload every pending chapter, one at a time. Blocks until done / stopped.
 
     This is the sequential engine — and the fallback used whenever parallel
     uploads are unavailable. The per-chapter work lives in _process_chapter,
     which parallel.py drives on several tabs at once.
+
+    ``idle_timeout`` defaults to the config's ``timeout_seconds``; pass a value
+    only to override it.
     """
 
     control = control or Control()
@@ -2106,8 +2698,8 @@ def run_upload_batch(
         idle_timeout=idle_timeout,
         on_cloudflare=on_cloudflare,
         cf_resolved_hook=cf_resolved_hook,
-        on_waf=on_waf,
-        waf_resolved_hook=waf_resolved_hook,
+        on_cloudflare_stuck=on_cloudflare_stuck,
+        cf_solver_hook=cf_solver_hook,
         on_challenge_cleared=on_challenge_cleared,
     )
 
@@ -2119,6 +2711,8 @@ def run_upload_batch(
         if control.stopped:
             log("[!] Stopped by user.")
             break
+        if control.aborted:
+            break
 
         if control.pause_event.is_set():
             log("[‖] Paused.")
@@ -2126,6 +2720,16 @@ def run_upload_batch(
             continue
 
         ch_num, file_path = pending[idx]
+
+        # Re-check just before uploading. The pending list is computed once, so
+        # a parallel worker that finished (or recovered and finished) this very
+        # chapter after that snapshot would otherwise be uploaded twice — which
+        # creates a duplicate chapter on comix.
+        if ctx.recorder.already_done(ch_num):
+            log(f"[i] Chapter {ch_num:g} was already uploaded — skipping.")
+            idx += 1
+            continue
+
         status, err, page = _process_chapter(page, ch_num, file_path, ctx)
 
         if status == "done":
@@ -2141,6 +2745,12 @@ def run_upload_batch(
             summary.processed += 1
             summary.failed += 1
             summary.failures.append((ch_num, Path(file_path).name, err))
+        elif status == "aborted":
+            # Origin down (or CF stuck): stop the whole batch. Nothing is
+            # recorded, so the chapter is retried on the next run.
+            summary.aborted = True
+            summary.abort_reason = err or summary.abort_reason
+            break
         else:
             # "pending": nothing was recorded — stop, exactly like before.
             break

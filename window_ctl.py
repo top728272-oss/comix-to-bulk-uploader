@@ -1,6 +1,6 @@
 """Windows-only helpers for locating and moving the Chrome window the app drives.
 
-The uploader runs a headful Chrome (the WAF/Cloudflare gates need a human in
+The uploader runs a headful Chrome (the Cloudflare check needs a human in
 front of it), but that does not mean it is allowed to grab the desktop. This
 module is the escape hatch: it finds the exact top-level window belonging to
 *our* browser process and can restore/foreground it when a verification needs
@@ -68,6 +68,17 @@ if IS_WINDOWS:  # pragma: no cover - platform specific
         ctypes.POINTER(ctypes.c_ulong),
     ]
     _user32.keybd_event.restype = None
+    _user32.MoveWindow.argtypes = [
+        wintypes.HWND,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.BOOL,
+    ]
+    _user32.MoveWindow.restype = wintypes.BOOL
+    _user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    _user32.GetWindowRect.restype = wintypes.BOOL
 else:  # pragma: no cover - platform specific
     _user32 = None
     _kernel32 = None
@@ -346,6 +357,28 @@ class ChromeWindow:
         except Exception:
             return False
 
+    def move(self, x: int, y: int, width: int | None = None, height: int | None = None) -> bool:
+        """Move the window on-screen (used to rescue an off-screen solver window)."""
+        hwnd = self.hwnd()
+        if not hwnd:
+            return False
+        try:
+            if width is None or height is None:
+                rect = wintypes.RECT()
+                if _user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                    width = width or (rect.right - rect.left)
+                    height = height or (rect.bottom - rect.top)
+                else:
+                    width = width or 1280
+                    height = height or 900
+            if _user32.IsIconic(hwnd):
+                _user32.ShowWindow(hwnd, SW_RESTORE)
+            return bool(
+                _user32.MoveWindow(hwnd, int(x), int(y), int(width), int(height), True)
+            )
+        except Exception:
+            return False
+
 
 def _force_foreground(hwnd) -> bool:
     """SetForegroundWindow, with the usual fallbacks.
@@ -397,5 +430,23 @@ def minimize_chrome(context, log=print) -> bool:
         return False
     try:
         return ChromeWindow(context, log=log).minimize()
+    except Exception:
+        return False
+
+
+def move_and_focus_chrome(context, x: int = 80, y: int = 80, log=print) -> bool:
+    """Pull an off-screen Chrome window back on screen and focus it.
+
+    Used by the Cloudflare solver when its (deliberately off-screen) window
+    needs to be visible for an interactive Turnstile step. Returns False off
+    Windows / on failure so the caller can fall back to relaunching on-screen.
+    """
+    if not IS_WINDOWS or context is None:
+        return False
+    try:
+        win = ChromeWindow(context, log=log)
+        if not win.move(x, y):
+            return False
+        return _force_foreground(win.hwnd())
     except Exception:
         return False

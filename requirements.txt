@@ -1,1 +1,5 @@
 playwright>=1.40.0
+# Drop-in Playwright fork used only by the Cloudflare solver (solver.py). It
+# avoids the CDP Runtime.enable signal that Cloudflare detects on the uploader's
+# Playwright-driven Chrome. Drives the system Chrome (channel="chrome").
+patchright>=1.63.0
