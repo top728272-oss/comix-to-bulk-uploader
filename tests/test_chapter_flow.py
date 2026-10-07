@@ -1,4 +1,4 @@
-"""Behaviour tests for the upload engine — no browser, no network.
+"""Behaviour tests for the upload engine - no browser, no network.
 
 Two things are being pinned down here:
 
@@ -256,7 +256,7 @@ class EngineTestCase(EngineHarness, unittest.TestCase):
             return True, None
 
         def on_status(ch, status, detail):
-            # Stop once chapter 1 is fully recorded — i.e. between chapters.
+            # Stop once chapter 1 is fully recorded - i.e. between chapters.
             if str(ch) == "1" and status == "done":
                 control.request_stop()
 
@@ -481,7 +481,7 @@ class AccessBlockTests(EngineHarness, unittest.TestCase):
     """A Cloudflare WAF block (Error 1020) stops the batch and records nothing.
 
     Distinct from both a challenge (nothing to wait for, no cookie helps) and a
-    dead origin (the site is up — it is this IP/path that is refused).
+    dead origin (the site is up - it is this IP/path that is refused).
     """
 
     def test_sequential_aborts_on_the_first_block(self):
@@ -515,7 +515,7 @@ class AccessBlockTests(EngineHarness, unittest.TestCase):
     def test_block_raises_the_right_error_from_a_blocked_upload_page(self):
         """The upload path must raise AccessBlockedError, not ServerDownError.
 
-        The block page has no upload form, so the form wait fails — which used
+        The block page has no upload form, so the form wait fails - which used
         to be misread as a dead origin.
         """
         page = FakeChallengePage(
@@ -576,7 +576,7 @@ class ParallelStallTests(unittest.TestCase):
         """A wedged worker may recover; it must not then resume the loop.
 
         Without this the abandoned worker keeps pulling chapters and uploading
-        them concurrently with the sequential retry — which is how one chapter
+        them concurrently with the sequential retry - which is how one chapter
         ended up uploaded twice and recorded as both done and failed.
         """
         released = threading.Event()
@@ -711,7 +711,7 @@ class DuplicateUploadGuardTests(EngineHarness, unittest.TestCase):
 
     def test_a_failure_never_contradicts_a_recorded_success(self):
         """A stale duplicate attempt must not leave one chapter both done and
-        failed — the state seen in upload_history/upload_failed for 14-17."""
+        failed - the state seen in upload_history/upload_failed for 14-17."""
         recorder = core.HistoryRecorder(URL)
         recorder.record_success(7)
         recorder.record_failure(7, "stale duplicate attempt")
@@ -790,7 +790,7 @@ class CloudflareDetectionTests(unittest.TestCase):
         page = FakeChallengePage(title="Just a moment...", wedged=True)
 
         # Every bounded read raises TimeoutError inside; none of these may hang
-        # or propagate — each detector just reports "no".
+        # or propagate - each detector just reports "no".
         self.assertFalse(core.page_is_responsive(page))
         self.assertFalse(core.is_cloudflare_active(page))
         self.assertFalse(core.is_cloudflare_error_page(page))
@@ -1004,7 +1004,7 @@ class AttachUploadFileTests(unittest.TestCase):
 
     The CDP route exists because Playwright's path-based file input takes ~16 s
     on a parallel worker's connect_over_cdp connection (it goes through the
-    private Playwright.grantFileReadAccess method) instead of ~0.1 s — which
+    private Playwright.grantFileReadAccess method) instead of ~0.1 s - which
     randomly exceeded the 30 s action timeout.
     """
 
@@ -1100,7 +1100,7 @@ class AttachUploadFileTests(unittest.TestCase):
         self.assertTrue(file_input.waited, "should still wait for the input")
 
     def test_consumed_input_counts_as_accepted(self):
-        """comix replaces the drop-zone input once it has the file — that must
+        """comix replaces the drop-zone input once it has the file - that must
         not be mistaken for a failure (it caused a pointless 30 s fallback)."""
         page = self._page(state="gone")
         file_input = self.FakeInput()

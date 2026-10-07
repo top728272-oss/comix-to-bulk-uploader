@@ -52,7 +52,7 @@ def refresh_clearance_interactive(config: ConfigStore) -> None:
     with sync_playwright() as p:
         context, page = launch_context(p, config.data)
         page.goto("https://comix.to", wait_until="domcontentloaded")
-        # Explicit "come solve this" action — make sure the window is in front.
+        # Explicit "come solve this" action - make sure the window is in front.
         focus_challenge_window(page, config.data)
         print(
             "\nPress Enter in this terminal after Cloudflare is passed / login is complete..."
@@ -68,7 +68,7 @@ def update_cookies_interactive(config: ConfigStore) -> None:
     """Paste a fresh cf_clearance (and optionally session) into config.json.
 
     Cloudflare can no longer be cleared by refreshing and can get stuck on
-    "Verifying you are human" — copying the cookie out of a browser that is
+    "Verifying you are human" - copying the cookie out of a browser that is
     already past the check is the reliable fix.
     """
     print("\n" + "=" * 50)
@@ -121,7 +121,7 @@ def collect_params(config: ConfigStore) -> UploadParams:
         if title_map:
             print(f"[✓] Loaded {len(title_map)} chapter titles from mapping.")
         else:
-            print("[!] No mapping lines found — falling back to title pattern.")
+            print("[!] No mapping lines found - falling back to title pattern.")
             title_map = None
 
     title_pattern = ""
@@ -244,7 +244,7 @@ def main() -> None:
         config = ConfigStore()
     except (FileNotFoundError, ValueError) as ex:
         # ValueError covers ConfigError (e.g. an out-of-range "concurrency")
-        # and malformed JSON — both must stop the run with a clear message.
+        # and malformed JSON - both must stop the run with a clear message.
         print(ex)
         sys.exit(1)
 
@@ -257,7 +257,7 @@ def main() -> None:
             return
         if action == "solve_cf":
             if not solver.solve_into_config(config):
-                print("[!] Auto-solve failed — try option [8] to paste cookies.")
+                print("[!] Auto-solve failed - try option [8] to paste cookies.")
             continue
         if action == "refresh":
             refresh_clearance_interactive(config)
@@ -276,7 +276,7 @@ def main() -> None:
         if enable_cdp:
             port = read_devtools_port()
             if port is None:
-                print("[!] Chrome's debug port did not appear — running sequentially.")
+                print("[!] Chrome's debug port did not appear - running sequentially.")
             else:
                 endpoint = f"http://127.0.0.1:{port}"
 
@@ -285,7 +285,7 @@ def main() -> None:
             print("  [!] CLOUDFLARE CHALLENGE DETECTED")
             print("=" * 60)
             print(f"Paused on chapter {ch_num}. Nothing was skipped or marked failed.")
-            print("comix's Cloudflare check usually clears by itself — the run")
+            print("comix's Cloudflare check usually clears by itself - the run")
             print("resumes on its own. Keep this terminal open.")
 
         def on_cloudflare_stuck(ch_num):
@@ -293,7 +293,7 @@ def main() -> None:
             print("  [!] CLOUDFLARE STUCK ON 'VERIFYING YOU ARE HUMAN'")
             print("=" * 60)
             print(f"Stopped on chapter {ch_num}. Nothing was marked failed.")
-            print("The automatic solver could not clear it either — get a fresh")
+            print("The automatic solver could not clear it either - get a fresh")
             print("cf_clearance cookie and use menu option [8] to paste it, then")
             print("run again.")
 
@@ -350,7 +350,7 @@ def main() -> None:
     print(f"Failed    : {summary.failed}")
     if getattr(summary, "aborted", False):
         print(
-            "[!] Server appears down — the batch was stopped. Nothing was "
+            "[!] Server appears down - the batch was stopped. Nothing was "
             "marked failed; try again once comix is back."
         )
         if summary.abort_reason:

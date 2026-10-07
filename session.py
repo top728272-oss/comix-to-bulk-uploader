@@ -205,7 +205,7 @@ class BrowserSession(threading.Thread):
     def _report_blocked_job(self, context: str, vreq: VerificationRequired) -> None:
         """A search or name lookup ran into a verification screen.
 
-        Unlike uploads, these jobs do not wait out the challenge — the tab is
+        Unlike uploads, these jobs do not wait out the challenge - the tab is
         already sitting on it, so the user solves it in Chrome whenever they
         like and simply retries the action afterwards.
         """
@@ -214,7 +214,7 @@ class BrowserSession(threading.Thread):
             f"[!] The Cloudflare challenge blocked the {what}. Clear it in the "
             f"Chrome window, then retry the {what} later."
         )
-        # Nothing else raises the window, so bring it forward here — otherwise
+        # Nothing else raises the window, so bring it forward here - otherwise
         # the user is told to clear a check they cannot see.
         focus_challenge_window(self.page, self.config.data, self._log)
         self.emit("job_blocked", (context, vreq.kind))
@@ -237,7 +237,7 @@ class BrowserSession(threading.Thread):
                 # The concurrency setting changed since this browser started
                 # (the DevTools endpoint is a launch flag), so relaunch. The
                 # profile keeps the login and the clearance cookies.
-                self._log("[i] Concurrency changed — restarting Chrome to match.")
+                self._log("[i] Concurrency changed - restarting Chrome to match.")
                 self._close_context()
 
         self.emit("browser", "starting")
@@ -253,7 +253,7 @@ class BrowserSession(threading.Thread):
             port = read_devtools_port()
             if port is None:
                 self._log(
-                    "[!] Chrome's debug port did not appear — parallel uploads "
+                    "[!] Chrome's debug port did not appear - parallel uploads "
                     "will fall back to sequential."
                 )
             else:

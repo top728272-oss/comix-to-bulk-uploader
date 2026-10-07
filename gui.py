@@ -1,8 +1,8 @@
-"""Comix Uploader — desktop GUI.
+"""Comix Uploader - desktop GUI.
 
 Search the site, pick a series once, and upload chapters without retyping
 URLs, folders, group names or title patterns. Cloudflare is cleared in the real
-Chrome window the app drives — the app watches the tabs and resumes on its own
+Chrome window the app drives - the app watches the tabs and resumes on its own
 once it clears, or asks you to paste fresh cookies when it cannot.
 """
 
@@ -65,7 +65,7 @@ class App(tk.Tk):
         self.title("Comix Uploader")
         self.configure(bg="#f4f6f8")
 
-        # Never open taller/wider than the screen — otherwise the run controls
+        # Never open taller/wider than the screen - otherwise the run controls
         # end up below the bottom edge and look like they don't exist.
         screen_w, screen_h = self.winfo_screenwidth(), self.winfo_screenheight()
         width = max(900, min(1180, screen_w - 80))
@@ -148,7 +148,7 @@ class App(tk.Tk):
         # Run controls sit near the top so they can never be pushed off-screen.
         self._build_controls(container)
         self._build_settings(container)
-        # Search panel is optional — it can be folded away to free up space.
+        # Search panel is optional - it can be folded away to free up space.
         self._build_series_panel(container)
 
         # Chapters + log share the remaining height and stay resizable.
@@ -278,7 +278,7 @@ class App(tk.Tk):
 
         self.target_label = ttk.Label(
             card,
-            text="No series selected — pick one above or search the site",
+            text="No series selected - pick one above or search the site",
             style="Card.TLabel",
             font=("Segoe UI", 10, "bold"),
         )
@@ -498,7 +498,7 @@ class App(tk.Tk):
         ).pack(side="right")
 
         # Cookie update row: when Cloudflare is stuck on "Verifying you are
-        # human" (or the login expired), refreshing no longer clears it — paste
+        # human" (or the login expired), refreshing no longer clears it - paste
         # fresh cookies here instead of hand-editing config.json.
         cookie_card = ttk.Frame(parent, style="Card.TFrame", padding=8)
         cookie_card.pack(fill="x", pady=(0, 8))
@@ -875,7 +875,7 @@ class App(tk.Tk):
             return
         self.title_map = None
         self.title_map_name = ""
-        self.append_log("[i] Chapter map cleared — title pattern is back in use.")
+        self.append_log("[i] Chapter map cleared - title pattern is back in use.")
         self._on_mapping_changed()
 
     def _on_mapping_changed(self, persist: bool = True) -> None:
@@ -961,7 +961,7 @@ class App(tk.Tk):
         for key, data in sorted(self.chapters.items(), key=lambda kv: float(kv[0])):
             mark = "☑" if data["selected"] else "☐"
             detail = data["detail"]
-            status_text = data["status"] + (f" — {detail}" if detail else "")
+            status_text = data["status"] + (f" - {detail}" if detail else "")
             if data["status"] == "pending":
                 pending += 1
             self.tree.insert(
@@ -992,7 +992,7 @@ class App(tk.Tk):
         data = self.chapters.get(row)
         if not data:
             return
-        # Clicking anywhere on the row toggles it — no need to hit the tiny box.
+        # Clicking anywhere on the row toggles it - no need to hit the tiny box.
         data["selected"] = not data["selected"]
         self._refresh_tree()
 
@@ -1060,14 +1060,14 @@ class App(tk.Tk):
 
     def _manual_clearance_fallback(self) -> None:
         self.append_log(
-            "[i] Opening Chrome — pass Cloudflare / log in, then come back."
+            "[i] Opening Chrome - pass Cloudflare / log in, then come back."
         )
         self.session.submit(("restart",))
         self.session.submit(("save_cookies",))
 
     def _on_cf_solve_failed(self, payload) -> None:
         self.append_log(
-            "[!] Automatic Cloudflare solve failed — falling back to manual. "
+            "[!] Automatic Cloudflare solve failed - falling back to manual. "
             "Clear the check in Chrome, or paste a fresh cf_clearance above."
         )
         self._manual_clearance_fallback()
@@ -1154,7 +1154,7 @@ class App(tk.Tk):
     def _show_cf_banner(self, chapter: str) -> None:
         self.cf_label.configure(
             text=(
-                f"Cloudflare is checking the browser (chapter {chapter}) — it "
+                f"Cloudflare is checking the browser (chapter {chapter}) - it "
                 "usually clears by itself; uploading resumes automatically."
             )
         )
@@ -1200,7 +1200,7 @@ class App(tk.Tk):
         for r in results:
             meta = r.get("meta") or ""
             self.results.insert(
-                "end", f"{r['name']}  —  {r['hid']}" + (f"  ({meta})" if meta else "")
+                "end", f"{r['name']}  -  {r['hid']}" + (f"  ({meta})" if meta else "")
             )
         self.search_status.configure(text=f"{len(results)} result(s)")
         if not results:
@@ -1225,7 +1225,7 @@ class App(tk.Tk):
         label = "Cloudflare challenge"
         if context == "search":
             self.search_status.configure(
-                text=f"Blocked by the {label} — solve it in Chrome, then search again"
+                text=f"Blocked by the {label} - solve it in Chrome, then search again"
             )
             self.append_log(
                 f"[i] Solve the {label} in the Chrome window and retry the "
@@ -1266,7 +1266,7 @@ class App(tk.Tk):
     def _refresh_run_label(self) -> None:
         """One label for both modes: a single chapter, or a parallel summary.
 
-        Only the "running" state is rewritten here — "Paused"/"Stopping…" are
+        Only the "running" state is rewritten here - "Paused"/"Stopping…" are
         the more important thing to show while they are true.
         """
         if self._run_state != "running":
@@ -1286,24 +1286,24 @@ class App(tk.Tk):
         # With several chapters in flight the single-chapter label would just
         # flicker between them; the tree shows each row's own status instead.
         if len(self.active_chapters) <= 1:
-            self.run_label.configure(text=f"Chapter {key} — {count} chunks")
+            self.run_label.configure(text=f"Chapter {key} - {count} chunks")
         self.update_idletasks()
 
     def _on_cloudflare(self, chapter) -> None:
         self.run_label.configure(text="Waiting for Cloudflare…")
         self._show_cf_banner(chapter)
         self.append_log(
-            "[!] Cloudflare challenge — it usually clears by itself and "
+            "[!] Cloudflare challenge - it usually clears by itself and "
             "uploading resumes automatically. You only need to act if it "
             "doesn't (use the banner buttons)."
         )
 
     def _on_cloudflare_stuck(self, chapter) -> None:
-        self.run_label.configure(text="Cloudflare is stuck — update cookies")
+        self.run_label.configure(text="Cloudflare is stuck - update cookies")
         self._hide_cf_banner()
         self.append_log(
             "[!] Cloudflare is stuck on 'Verifying you are human'. Refreshing "
-            "no longer clears it — paste a fresh cf_clearance in the cookie row "
+            "no longer clears it - paste a fresh cf_clearance in the cookie row "
             "above and press 'Update cookies', then start again."
         )
         try:
@@ -1320,9 +1320,9 @@ class App(tk.Tk):
     def _on_challenge_cleared(self, payload) -> None:
         kind, chapter = payload
         self._hide_cf_banner()
-        self.run_label.configure(text="Resumed — uploading…")
+        self.run_label.configure(text="Resumed - uploading…")
         self.append_log(
-            f"[✓] Cloudflare cleared on chapter {chapter} — resuming automatically."
+            f"[✓] Cloudflare cleared on chapter {chapter} - resuming automatically."
         )
 
     def _on_run_state(self, state) -> None:
@@ -1350,14 +1350,14 @@ class App(tk.Tk):
         )
         if getattr(summary, "aborted", False):
             self.append_log(
-                "[!] Server appears down — the batch was stopped. Nothing was "
+                "[!] Server appears down - the batch was stopped. Nothing was "
                 "marked failed; try again once comix is back."
                 + (f" ({summary.abort_reason})" if summary.abort_reason else "")
             )
         for ch, filename, err in summary.failures:
             self.append_log(f"  - Chapter {ch:g} ({filename}): {err}")
         self.run_label.configure(
-            text=f"Done — {summary.succeeded} uploaded, {summary.failed} failed"
+            text=f"Done - {summary.succeeded} uploaded, {summary.failed} failed"
         )
 
     # ------------------------------------------------------------- teardown

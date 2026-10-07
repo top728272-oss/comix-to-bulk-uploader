@@ -13,7 +13,7 @@ the uploader.
 Design
 ------
 * ``mint_clearance`` runs inside a **separate process** (``python -m solver``)
-  driven by **patchright** — a drop-in Playwright fork that avoids the
+  driven by **patchright** - a drop-in Playwright fork that avoids the
   ``Runtime.enable`` leak. It uses the real system Chrome
   (``channel="chrome"``) so its User-Agent matches the uploader's, because
   ``cf_clearance`` is bound to the exact UA (and IP) that earned it.
@@ -78,7 +78,7 @@ _last_result: dict = {"ts": 0.0, "ok": False, "cookies": []}
 
 
 # --------------------------------------------------------------------------
-# Pure helpers (no browser — unit-tested)
+# Pure helpers (no browser - unit-tested)
 # --------------------------------------------------------------------------
 
 
@@ -217,7 +217,7 @@ def mint_clearance(
                 and _should_escalate(elapsed, focus_after)
             ):
                 escalated = True
-                log("[i] Solver still blocked — bringing its window to the front.")
+                log("[i] Solver still blocked - bringing its window to the front.")
                 try:
                     import window_ctl
 
@@ -376,7 +376,7 @@ def make_cf_solver_hook(config: dict, log: Callable = print) -> Callable:
 
     The hook injects cookies into the CALLER's own context (thread-affine: the
     sequential engine passes the session context, parallel workers pass their
-    own), and never writes config.json — persistence happens later on the
+    own), and never writes config.json - persistence happens later on the
     session thread via ``core.sync_cookies_from_context``.
     """
     cf = core.cloudflare_config(config)
@@ -386,7 +386,7 @@ def make_cf_solver_hook(config: dict, log: Callable = print) -> Callable:
         if not cf.get("auto_solve", True):
             return False
         with _SOLVE_LOCK:
-            # Another worker just solved it (shared browser) — reuse.
+            # Another worker just solved it (shared browser) - reuse.
             if _last_result["ok"] and (
                 time.time() - _last_result["ts"] < RECENT_SOLVE_SECONDS
             ):
@@ -428,7 +428,7 @@ def _warn_on_ua_mismatch(context, solver_ua: str, log: Callable) -> None:
         return
     if browser_ua and browser_ua != solver_ua:
         log(
-            "[!] Solver User-Agent differs from the uploader's — the clearance "
+            "[!] Solver User-Agent differs from the uploader's - the clearance "
             "may be rejected. Make sure both use the same Google Chrome."
         )
 

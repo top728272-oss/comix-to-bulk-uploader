@@ -2,7 +2,7 @@
 
 Run from the project root:  .venv\\Scripts\\python.exe -m unittest discover tests
 
-Covers parse_chapter_mapping, clean_mapped_title and resolve_chapter_title —
+Covers parse_chapter_mapping, clean_mapped_title and resolve_chapter_title -
 all stdlib-only, no browser needed.
 """
 

@@ -1,4 +1,4 @@
-"""Tests for solver.py — the automatic Cloudflare clearance helper.
+"""Tests for solver.py - the automatic Cloudflare clearance helper.
 
 No browser and no patchright needed: the pure helpers and the parent-side hook
 are exercised directly, and the browser path is only reached behind
