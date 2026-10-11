@@ -111,12 +111,40 @@ def run_upload_batch_auto(page, endpoint, config: dict, params, **kwargs) -> Run
     return summary
 
 
-def _sleep_between_chapters(delay, control: Control) -> None:
-    """Per-worker pacing, same intent as the sequential inter-chapter delay."""
-    for _ in range(int(delay)):
-        if control.stopped or control.aborted:
-            return
-        time.sleep(1)
+class UploadPacer:
+    """Global start pacing shared by all parallel workers.
+
+    The per-worker sleep this replaces only slowed one tab down, so N tabs
+    could still POST within the same second. The pacer serialises starts:
+    no two uploads begin closer than ``delay`` seconds apart.
+    """
+
+    def __init__(self, delay: float) -> None:
+        self.delay = max(0.0, float(delay or 0))
+        self._lock = threading.Lock()
+        self._next_allowed = time.monotonic()
+
+    def wait(self, control: Control) -> bool:
+        """Block until this worker may start its next upload.
+
+        Returns False when the run was stopped or aborted mid-wait, so the
+        caller can requeue the chapter instead of uploading it.
+        """
+        if self.delay <= 0:
+            return not (control.stopped or control.aborted)
+        while True:
+            if control.stopped or control.aborted:
+                return False
+            if control.pause_event.is_set():
+                control.pause_event.wait(0.5)
+                continue
+            with self._lock:
+                now = time.monotonic()
+                if now >= self._next_allowed:
+                    self._next_allowed = now + self.delay
+                    return True
+                wait_for = self._next_allowed - now
+            control.pause_event.wait(min(wait_for, 0.5))
 
 
 # Seconds without a heartbeat before a worker is treated as wedged. Playwright's
@@ -289,6 +317,13 @@ def _run_parallel(
     for item in pending:
         work.put(item)
 
+    pacer = UploadPacer(params.delay)
+    if pacer.delay > 0:
+        log(
+            f"[i] Pacing uploads: at least {pacer.delay:g}s between starts "
+            f"across {n} tab(s)."
+        )
+
     challenge_cfg = core.challenge_config(config)
     challenge_max_wait = int(challenge_cfg.get("max_wait_seconds", 600))
     challenge_poll = float(challenge_cfg.get("poll_interval_seconds", 2))
@@ -404,11 +439,13 @@ def _run_parallel(
                 # Tell the watchdog which chapter this tab is on.
                 state.beat(ch_num)
 
+                if not pacer.wait(control):
+                    work.put((ch_num, file_path))
+                    break
+
                 status, err, _page = _process_chapter(page, ch_num, file_path, ctx)
                 rows.append((ch_num, file_path, status, err))
                 state.beat(ch_num)
-                if status == "done" and not work.empty():
-                    _sleep_between_chapters(params.delay, control)
                 if control.aborted:
                     break
         except Exception:
