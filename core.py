@@ -1205,18 +1205,21 @@ def require_no_cloudflare(
     require_no_challenge(page, message)
 
 
-def _raise_if_access_blocked(page) -> None:
+def _raise_if_access_blocked(page, path: str = "the upload path") -> None:
     """Raise AccessBlockedError when Cloudflare's WAF block page is showing.
 
     Separate from ``require_no_challenge`` because a block is not a gate: there
     is nothing to wait out and no cookie to refresh. The message has to say so,
     or the user is sent to solve a captcha that does not exist.
+
+    ``path`` names what was blocked, so the message does not accuse the upload
+    path of something the user asked a search to do.
     """
     if not is_cloudflare_access_block(page):
         return
     ray = cloudflare_ray_id(page)
     raise AccessBlockedError(
-        "Cloudflare blocked this IP on the upload path"
+        f"Cloudflare blocked this IP on {path}"
         + (f" (Ray ID {ray})" if ray else "")
         + ". No cookie can clear a WAF block - switch network (VPN) or set "
         "config.proxy, then retry.",
@@ -1602,7 +1605,7 @@ def _search_site_once(page, query: str, limit: int, log: Callable):
     page.wait_for_timeout(800)
     # Before the challenge check: a ban is terminal for this IP and must not be
     # reported as a solvable verification screen.
-    _raise_if_access_blocked(page)
+    _raise_if_access_blocked(page, "the search path")
     require_no_challenge(
         page, "A verification screen blocked the site while searching."
     )
@@ -1633,7 +1636,7 @@ def _search_site_once(page, query: str, limit: int, log: Callable):
     except Exception:
         # The popup's own request can be gated or blocked while the document
         # still looks perfectly fine, so re-check both here.
-        _raise_if_access_blocked(page)
+        _raise_if_access_blocked(page, "the search path")
         kind = detect_challenge(page)
         if kind:
             raise _exception_for(

@@ -463,5 +463,66 @@ class SessionSearchRotationTests(unittest.TestCase):
         self.assertEqual(events, [("manual", "search")])
 
 
+class NoVpnClientTests(unittest.TestCase):
+    """urbproxy.py is gitignored and local-only, so it may simply be absent.
+
+    Nothing on the search path may depend on it existing.
+    """
+
+    def setUp(self) -> None:
+        self._saved = core.urbproxy
+
+    def tearDown(self) -> None:
+        core.urbproxy = self._saved
+
+    def test_absent_module_imports_and_searches(self):
+        core.urbproxy = None
+        page = FakeSearchPage(["clean"])
+
+        results = core.search_site(page, "one piece")
+
+        self.assertEqual([r["hid"] for r in results], ["abc12", "def34"])
+
+    def test_absent_module_makes_rotation_a_clean_no(self):
+        core.urbproxy = None
+        self.assertFalse(core.rotate_vpn_egress(log=lambda _m: None))
+
+    def test_a_stale_module_without_the_new_helpers_degrades(self):
+        # An older urbproxy.py in the wild has no current_ip/rotate_egress.
+        # That must surface as a clean "could not rotate", never an AttributeError.
+        class Stale:
+            @staticmethod
+            def is_active():
+                return True
+
+        core.urbproxy = Stale
+        logs: list = []
+
+        self.assertFalse(core.rotate_vpn_egress(log=logs.append))
+        self.assertTrue(any("rotate" in m.lower() for m in logs))
+
+    def test_a_ban_still_reports_cleanly_without_rotation(self):
+        core.urbproxy = None
+        events: list = []
+        logs: list = []
+        sess = session_mod.BrowserSession.__new__(session_mod.BrowserSession)
+        sess.page = None
+        sess.context = None
+        sess.config = mock.Mock()
+        sess.config.data = {}
+        sess.emit = lambda event, payload=None: events.append((event, payload))
+        sess._log = logs.append
+        sess._ensure_browser = lambda: None
+        sess._close_context = lambda: None
+
+        def blocked(*_a, **_k):
+            raise core.AccessBlockedError("Cloudflare blocked this IP.")
+
+        with mock.patch.object(session_mod, "search_site", blocked):
+            sess._run_search("one piece")
+
+        self.assertEqual(events, [("job_blocked", ("search", "access_blocked"))])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -237,7 +237,7 @@ class BrowserSession(threading.Thread):
                 self.emit("search_results", results)
                 return
             except AccessBlockedError as blocked:
-                rotated = ""
+                reason = ""
                 if attempt <= SEARCH_MAX_ROTATIONS:
                     self._log(
                         f"[!] {blocked}. Rotating the VPN egress "
@@ -247,16 +247,16 @@ class BrowserSession(threading.Thread):
                         # Chrome holds the old egress until it is relaunched.
                         self._close_context()
                         continue
-                    rotated = (
+                    reason = (
                         " No alternative exit IP is available - switch the VPN "
                         "off or pick another country."
                     )
                 else:
-                    rotated = (
+                    reason = (
                         f" Already rotated {SEARCH_MAX_ROTATIONS} time(s) without "
                         "a working exit IP."
                     )
-                self._log(f"[!] {blocked}.{rotated}")
+                self._log(f"[!] {blocked}{reason}")
                 self.emit("job_blocked", ("search", blocked.kind))
                 return
             except VerificationRequired as vreq:
