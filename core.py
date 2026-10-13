@@ -1521,17 +1521,31 @@ def wait_for_challenge_clear(
 # Site search (runs through the real browser: the API needs a per-request token)
 # --------------------------------------------------------------------------
 
-# One attempt is a navigation plus a 10 s wait for the popup, so this is bounded
+# One attempt is a navigation plus a wait for the popup, so this is bounded
 # to well under a minute even when every attempt has to be solved.
 SEARCH_MAX_ATTEMPTS = 3
-# The popup intermittently renders nothing at all. Only the missing markup
-# separates that from a query that genuinely has no matches, so an unmarked
-# empty result is retried this many times before being believed.
+# The popup intermittently renders nothing, and its empty marker is transient
+# while a long query is still being typed. Both are indistinguishable from a
+# real miss on a single pass, so an unmarked or empty result is confirmed with a
+# second pass before it is believed.
 SEARCH_RENDER_RETRIES = 2
+# How long the popup may take to produce results. Long queries are typed
+# character by character, and the site's request is debounced behind that, so
+# this has to outlast the typing itself.
+SEARCH_RESULT_TIMEOUT_SECONDS = 20.0
+# How long the empty marker must hold still before the pass calls it a miss.
+SEARCH_EMPTY_SETTLE_SECONDS = 2.5
+# Let the result rows finish painting before reading them.
+SEARCH_RESULT_SETTLE_MS = 300
+SEARCH_POLL_MS = 200
 
 
 class _SearchRenderTimeout(RuntimeError):
     """The results popup rendered neither results nor its empty-state marker."""
+
+
+class _SearchNoMatch(RuntimeError):
+    """The popup settled on its empty-state marker - not yet believed."""
 
 
 def search_site(
@@ -1554,6 +1568,11 @@ def search_site(
     An egress IP ban (``AccessBlockedError``) is deliberately NOT solved: no
     cookie clears it, so it propagates for the caller to rotate the VPN or
     report the ban.
+
+    A popup that renders nothing, or that shows its empty marker, is retried
+    before it counts. The site's empty marker doubles as a transient state while
+    a long query is still being typed, so believing the first one is what made
+    longer queries come back as zero results.
     """
     query = (query or "").strip()
     if not query:
@@ -1582,6 +1601,15 @@ def search_site(
                 solved = False
             if not solved:
                 raise vreq
+        except _SearchNoMatch:
+            render_retries += 1
+            if attempt >= attempts or render_retries >= SEARCH_RENDER_RETRIES:
+                logger(f"Search '{query}': no matches.")
+                return []
+            logger(
+                f"[i] The popup showed no results - confirming "
+                f"(attempt {attempt}/{attempts})."
+            )
         except _SearchRenderTimeout:
             render_retries += 1
             if attempt >= attempts or render_retries >= SEARCH_RENDER_RETRIES:
@@ -1629,25 +1657,60 @@ def _search_site_once(page, query: str, limit: int, log: Callable):
     inp.fill("")
     inp.press_sequentially(query, delay=45)
 
-    try:
-        page.wait_for_selector(
-            ".search-pop__item--result, .search-pop__empty", timeout=10000
-        )
-    except Exception:
-        # The popup's own request can be gated or blocked while the document
-        # still looks perfectly fine, so re-check both here.
-        _raise_if_access_blocked(page, "the search path")
-        kind = detect_challenge(page)
-        if kind:
-            raise _exception_for(
-                kind, "A verification screen blocked the site while searching."
-            )
-        raise _SearchRenderTimeout(query)
-    page.wait_for_timeout(600)
+    return _await_search_results(page, query, limit, log)
 
-    # The one deliberate un-bounded read: eval_on_selector_all takes no timeout,
-    # but it is read-only and preceded by a 10 s wait that proves the renderer
-    # is answering.
+
+def _await_search_results(page, query: str, limit: int, log: Callable):
+    """Wait for the popup to settle, then scrape it.
+
+    ``.search-pop__empty`` is NOT a completion signal on its own. While a long
+    query is still being typed the site renders it for the prefixes typed so far
+    and swaps in the real results a moment later - measured at roughly 800 ms on
+    a 42-character query, and wider on a slow egress. So an empty popup only
+    raises once it has held still for ``SEARCH_EMPTY_SETTLE_SECONDS``, and even
+    then ``_SearchNoMatch`` asks the caller to confirm before believing it.
+
+    Raises ``_SearchRenderTimeout`` when the popup never rendered at all, and
+    re-checks the Cloudflare gates before that, because the popup's own request
+    can be blocked while the document still looks fine.
+    """
+    deadline = time.time() + SEARCH_RESULT_TIMEOUT_SECONDS
+    empty_since: float | None = None
+
+    while time.time() < deadline:
+        if _safe_visible(page, ".search-pop__item--result"):
+            page.wait_for_timeout(SEARCH_RESULT_SETTLE_MS)
+            rows = _scrape_search_rows(page, query, limit, log)
+            if rows:
+                return rows
+        elif _safe_visible(page, ".search-pop__empty"):
+            now = time.time()
+            if empty_since is None:
+                empty_since = now
+            elif now - empty_since >= SEARCH_EMPTY_SETTLE_SECONDS:
+                # Not believed yet: search_site confirms with a second pass
+                # before reporting this as a genuine miss.
+                raise _SearchNoMatch(query)
+        else:
+            empty_since = None
+        page.wait_for_timeout(SEARCH_POLL_MS)
+
+    _raise_if_access_blocked(page, "the search path")
+    kind = detect_challenge(page)
+    if kind:
+        raise _exception_for(
+            kind, "A verification screen blocked the site while searching."
+        )
+    raise _SearchRenderTimeout(query)
+
+
+def _scrape_search_rows(page, query: str, limit: int, log: Callable) -> list:
+    """Read the rendered results out of the popup.
+
+    The one deliberate un-bounded read: eval_on_selector_all takes no timeout,
+    but it is read-only and the caller only reaches it after a bounded poll
+    proved the renderer is answering and that results are present.
+    """
     raw = page.eval_on_selector_all(
         ".search-pop__item--result",
         """els => els.map(e => {

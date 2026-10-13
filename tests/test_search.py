@@ -11,6 +11,7 @@ Run: .venv\\Scripts\\python.exe -m unittest discover tests
 from __future__ import annotations
 
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -32,6 +33,28 @@ RESULT_ROWS = [
 CHALLENGE_BODY = (
     "Performing security verification. Cloudflare Ray ID: a49f1369fb9e9878"
 )
+
+
+class FakeClock:
+    """Virtual time for the popup wait loop.
+
+    The empty-settle timer is real wall-clock work in production; here it must
+    not cost minutes of test time, so wait_for_timeout() advances a counter
+    instead of sleeping.
+    """
+
+    def __init__(self, real) -> None:
+        self._real = real
+        self.t = 1000.0
+
+    def time(self) -> float:
+        return self.t
+
+    def advance(self, ms: float) -> None:
+        self.t += float(ms) / 1000.0
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
 
 
 class FakeLocator:
@@ -71,13 +94,32 @@ class FakeLocator:
         self._page.typed.append(("fill", value))
 
     def press_sequentially(self, value, delay=None) -> None:
+        # Typing costs wall-clock time in the browser, and the site's debounced
+        # request only starts once the last character lands.
         self._page.typed.append(("type", value))
+        self._page.clock.advance(len(value) * (delay or 0))
 
 
 class FakeSearchPage:
-    """A tab whose gate state and popup behaviour are scripted per navigation."""
+    """A tab whose gate state and popup behaviour are scripted per navigation.
 
-    def __init__(self, states: list, block_on_query: bool = False) -> None:
+    ``popup`` scripts what the results popup does over time, which is where the
+    real behaviour lives:
+
+      results          results appear and stay
+      empty            the empty marker appears and stays (genuine no matches)
+      transient        empty appears first, results land ``results_after_s``
+                      later - the race that made long queries return nothing
+      none             neither ever renders
+    """
+
+    def __init__(
+        self,
+        states: list,
+        block_on_query: bool = False,
+        clock: FakeClock | None = None,
+        results_after_s: float = 2.5,
+    ) -> None:
         # Each entry is the state a single goto() lands on; the last one
         # repeats, so a script shorter than the attempt count still works.
         self._states = states or ["clean"]
@@ -89,13 +131,16 @@ class FakeSearchPage:
         self.title_text = "Comix - Read Comics online for free"
         self.body_text = "home page"
         self.html_extra = ""
-        # "results" | "empty" | "none"
+        # "results" | "empty" | "transient" | "none"
         self.popup = "results"
+        self.results_after_s = results_after_s
+        self.clock = clock or FakeClock(time)
         # Gate states: clean | challenge | blocked | outage
         self.gate = "clean"
         # The popup's own request gets banned while the document loaded fine -
         # the shape a search-time IP ban actually takes.
         self.block_on_query = block_on_query
+        self._t0 = self.clock.time()
 
     def _apply(self) -> None:
         # gotos is incremented before this runs, so the first goto is index 0.
@@ -105,11 +150,12 @@ class FakeSearchPage:
         self.gate = gate
         if popup:
             self.popup = popup
+        self._t0 = self.clock.time()
         if gate == "challenge":
             self.title_text = "Just a moment..."
             self.body_text = CHALLENGE_BODY
             self.html_extra = "challenge-platform cf-chl-opt"
-        elif gate == "blocked":
+        if gate == "blocked":
             self.title_text = "Attention Required! | Cloudflare"
             self.body_text = (
                 "Sorry, you have been blocked. You are unable to access comix.to. "
@@ -125,9 +171,38 @@ class FakeSearchPage:
             self.body_text = "home page"
             self.html_extra = ""
 
+    def _popup_state(self) -> str:
+        """What the popup shows right now, given virtual elapsed time."""
+        if self.block_on_query:
+            # The popup's own request was banned: the document still looks
+            # fine, but the tab now carries the WAF block page.
+            self._apply_block()
+            return "blocked"
+        elapsed = self.clock.time() - self._t0
+        if self.popup == "results":
+            return "results"
+        if self.popup == "empty":
+            return "empty"
+        if self.popup == "transient":
+            return "results" if elapsed >= self.results_after_s else "empty"
+        return "none"
+
+    def _apply_block(self) -> None:
+        self.gate = "blocked"
+        self.title_text = "Attention Required! | Cloudflare"
+        self.body_text = (
+            "Sorry, you have been blocked. You are unable to access comix.to. "
+            "Cloudflare Ray ID: 8a1b2c3d4e5f6a7b"
+        )
+        self.html_extra = ""
+
     def visible(self, selector: str) -> bool:
         if self.gate == "challenge" and "challenge" in selector:
             return True
+        if "search-pop__item--result" in selector:
+            return self._popup_state() == "results"
+        if "search-pop__empty" in selector:
+            return self._popup_state() == "empty"
         if self.gate == "blocked" and "cf-error-details" in selector:
             return False
         if self.gate == "outage" and "cf-error-details" in selector:
@@ -145,21 +220,10 @@ class FakeSearchPage:
         self._apply()
 
     def wait_for_timeout(self, ms) -> None:
-        return None
-
-    def wait_for_selector(self, selector, timeout=None) -> None:
-        if self.block_on_query:
-            self.gate = "blocked"
-            self.title_text = "Attention Required! | Cloudflare"
-            self.body_text = (
-                "Sorry, you have been blocked. You are unable to access comix.to. "
-                "Cloudflare Ray ID: 8a1b2c3d4e5f6a7b"
-            )
-        if self.popup == "none":
-            raise TimeoutError("popup never rendered")
+        self.clock.advance(ms)
 
     def eval_on_selector_all(self, selector, js):
-        return [] if self.popup != "results" else list(RESULT_ROWS)
+        return list(RESULT_ROWS) if self._popup_state() == "results" else []
 
     def locator(self, selector: str) -> FakeLocator:
         return FakeLocator(self, selector)
@@ -196,8 +260,20 @@ class SearchGateDetectionTests(unittest.TestCase):
 
 
 class SearchAutoSolveTests(unittest.TestCase):
+    """Every test drives the popup wait on a virtual clock (see FakeClock)."""
+
+    def setUp(self) -> None:
+        self.clock = FakeClock(time)
+        patcher = mock.patch.object(core, "time", self.clock)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _page(self, *args, **kwargs) -> FakeSearchPage:
+        kwargs.setdefault("clock", self.clock)
+        return FakeSearchPage(*args, **kwargs)
+
     def test_clean_search_returns_parsed_results(self):
-        page = FakeSearchPage(["clean"])
+        page = self._page(["clean"])
         results = core.search_site(page, "one piece")
 
         self.assertEqual([r["hid"] for r in results], ["abc12", "def34"])
@@ -206,13 +282,35 @@ class SearchAutoSolveTests(unittest.TestCase):
         self.assertEqual(results[0]["url"], "https://comix.to/title/abc12-one-piece")
         self.assertEqual(page.typed, [("fill", ""), ("type", "one piece")])
 
+    def test_transient_empty_popup_waits_for_the_real_results(self):
+        # The regression: the site renders its empty marker while a long query
+        # is still being typed, then swaps in results ~800 ms later. Believing
+        # the first empty render is what made long queries return nothing.
+        page = self._page(["clean:transient"], results_after_s=2.5)
+
+        results = core.search_site(page, "I Become Invincible after She Saves Me")
+
+        self.assertEqual([r["hid"] for r in results], ["abc12", "def34"])
+        self.assertEqual(page.gotos, 1)
+
+    def test_transient_empty_longer_than_the_settle_is_confirmed_then_believed(self):
+        # A popup that stays empty past the settle window still gets a second
+        # pass, because the transient window widens on a slow egress.
+        page = self._page(["clean:transient"], results_after_s=30.0)
+        logs: list = []
+
+        self.assertEqual(core.search_site(page, "nope", log=logs.append), [])
+        self.assertEqual(page.gotos, 2)
+        self.assertTrue(any("confirming" in m for m in logs))
+        self.assertTrue(any("no matches" in m for m in logs))
+
     def test_blank_query_short_circuits(self):
-        page = FakeSearchPage(["clean"])
+        page = self._page(["clean"])
         self.assertEqual(core.search_site(page, "   "), [])
         self.assertEqual(page.gotos, 0)
 
     def test_challenge_triggers_the_solver_and_retries(self):
-        page = FakeSearchPage(["challenge", "clean"])
+        page = self._page(["challenge", "clean"])
         seen: list = []
 
         def hook(context, log=None):
@@ -225,20 +323,20 @@ class SearchAutoSolveTests(unittest.TestCase):
         self.assertEqual(len(results), 2)
 
     def test_solver_refusal_re_raises_the_challenge(self):
-        page = FakeSearchPage(["challenge"])
+        page = self._page(["challenge"])
         hook = lambda context, log=None: False  # noqa: E731
 
         with self.assertRaises(core.VerificationRequired):
             core.search_site(page, "one piece", cf_solver_hook=hook)
 
     def test_no_hook_means_the_challenge_propagates(self):
-        page = FakeSearchPage(["challenge"])
+        page = self._page(["challenge"])
 
         with self.assertRaises(core.VerificationRequired):
             core.search_site(page, "one piece")
 
     def test_solver_is_not_called_after_the_last_attempt(self):
-        page = FakeSearchPage(["challenge"])
+        page = self._page(["challenge"])
         calls: list = []
         hook = lambda context, log=None: calls.append(1) or True  # noqa: E731
 
@@ -248,7 +346,7 @@ class SearchAutoSolveTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
     def test_banned_egress_is_never_handed_to_the_solver(self):
-        page = FakeSearchPage(["blocked"])
+        page = self._page(["blocked"])
         calls: list = []
         hook = lambda context, log=None: calls.append(1) or True  # noqa: E731
 
@@ -258,7 +356,7 @@ class SearchAutoSolveTests(unittest.TestCase):
 
     def test_block_detected_after_the_query_still_propagates(self):
         # The popup's own request can be banned while the document loaded fine.
-        page = FakeSearchPage(["clean:none"], block_on_query=True)
+        page = self._page(["clean"], block_on_query=True)
         calls: list = []
         hook = lambda context, log=None: calls.append(1) or True  # noqa: E731
 
@@ -267,8 +365,7 @@ class SearchAutoSolveTests(unittest.TestCase):
         self.assertEqual(calls, [])
 
     def test_unrendered_popup_is_retried_then_reported_as_empty(self):
-        page = FakeSearchPage(["clean"])
-        page.popup = "none"
+        page = self._page(["clean:none"])
         logs: list = []
 
         results = core.search_site(page, "one piece", log=logs.append)
@@ -277,14 +374,17 @@ class SearchAutoSolveTests(unittest.TestCase):
         self.assertGreater(page.gotos, 1, "a popup that renders nothing is retried")
         self.assertTrue(any("never rendered" in m for m in logs))
 
-    def test_empty_marker_is_believed_without_retrying(self):
-        page = FakeSearchPage(["clean"])
-        page.popup = "empty"
+    def test_empty_marker_is_confirmed_before_being_believed(self):
+        # A genuine miss is still not taken on trust: the popup's empty marker
+        # doubles as a transient state while a long query is being typed.
+        page = self._page(["clean:empty"])
+        logs: list = []
 
-        results = core.search_site(page, "nothing matches this at all")
+        results = core.search_site(page, "nothing matches this at all", log=logs.append)
 
         self.assertEqual(results, [])
-        self.assertEqual(page.gotos, 1)
+        self.assertEqual(page.gotos, 2)
+        self.assertTrue(any("confirming" in m for m in logs))
 
 
 class RotateEgressTests(unittest.TestCase):
@@ -471,13 +571,21 @@ class NoVpnClientTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self._saved = core.urbproxy
+        self.clock = FakeClock(time)
+        patcher = mock.patch.object(core, "time", self.clock)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _page(self, *args, **kwargs) -> FakeSearchPage:
+        kwargs.setdefault("clock", self.clock)
+        return FakeSearchPage(*args, **kwargs)
 
     def tearDown(self) -> None:
         core.urbproxy = self._saved
 
     def test_absent_module_imports_and_searches(self):
         core.urbproxy = None
-        page = FakeSearchPage(["clean"])
+        page = self._page(["clean"])
 
         results = core.search_site(page, "one piece")
 
