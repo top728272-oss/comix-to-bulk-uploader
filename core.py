@@ -362,43 +362,6 @@ def effective_proxy(config: dict, refresh_vpn: bool = True) -> dict | None:
     return proxy_config(config)
 
 
-def vpn_gateway_active() -> bool:
-    """True while traffic is routed through the UrbanVPN gateway."""
-    if urbproxy is None:
-        return False
-    try:
-        return bool(urbproxy.is_active())
-    except Exception:
-        return False
-
-
-def effective_concurrency(config: dict) -> int:
-    """Worker count this network can actually sustain.
-
-    Parallel workers are driven over ``connect_over_cdp``, which takes no proxy
-    argument - so those connections carry no gateway credentials. Chrome hits
-    the gateway's 407 and the auth handshake stalls, leaving every worker tab
-    parked on about:blank while the launch tab works fine. Measured: direct
-    connection, 2 worker tabs navigate in under a second each; behind the
-    gateway they never resolve.
-
-    It is NOT a gateway tunnel limit - four concurrent CONNECT tunnels on one
-    token all succeed at the socket level - and a second token would not help,
-    because the missing piece is credentials in the worker's connection rather
-    than the credential itself.
-
-    One page is one connection, so the gateway means sequential uploads. A
-    plain ``config.proxy`` is not affected and keeps its configured count.
-    """
-    try:
-        n = validate_concurrency(config.get("concurrency", DEFAULT_CONCURRENCY))
-    except ConfigError:
-        n = 1
-    if n > 1 and vpn_gateway_active():
-        return 1
-    return n
-
-
 def rotate_vpn_egress(log: Callable = print) -> bool:
     """Move the VPN to a different egress after this IP was banned.
 
