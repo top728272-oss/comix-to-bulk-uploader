@@ -45,12 +45,17 @@ CLEARANCE_COOKIE_HINTS = ("clearance", "challenge")
 
 # Cloudflare error-page markers (502/521/522/...). Test these before the
 # challenge detector: those pages render the same div#cf-wrapper a challenge
-# does. The WAF block page also carries a Ray ID, so check it first.
+# does.
+#
+# "ray id" is deliberately NOT here. Every Cloudflare page footer carries one,
+# challenges included, so matching it made is_cloudflare_error_page() report a
+# live challenge as an origin outage - which then suppressed is_cloudflare_active()
+# and left a challenged tab looking like a page that simply had no search results.
+# Extract the Ray ID with _RAY_ID_RE instead, when it is actually needed.
 CF_ERROR_MARKERS = (
     ".cf-error-details",
     "#cf-error-details",
     "error 5",
-    "ray id",
     "connection timed out",
     "web server is down",
     "webserver is down",
@@ -80,6 +85,10 @@ CF_CHALLENGE_MARKERS = (
     "_cf_chl_opt",
     "challenge-platform",
 )
+# A live interstitial's title. Checked ahead of every error-page marker: a
+# challenge and a 5xx look alike in the body text, but the title tells them
+# apart unambiguously.
+CF_CHALLENGE_TITLE_RE = re.compile(r"^\s*(just a moment|attention required!)\b", re.I)
 # Generic Turnstile markers. These CAN appear on a legitimate page (comix's own
 # login/upload widget), so they only count when no upload form is rendered.
 CF_TURNSTILE_MARKERS = (
@@ -1021,13 +1030,18 @@ def is_cloudflare_error_page(page) -> bool:
     """True when the tab is a Cloudflare *error* page (origin down), not a check.
 
     Tested before the challenge detector because Cloudflare's 5xx pages render
-    the same ``div#cf-wrapper`` a challenge does. The WAF block page is excluded.
+    the same ``div#cf-wrapper`` a challenge does. The WAF block page is
+    excluded, and so is a live challenge: the two must never be confused, or a
+    challenge reads as an outage and nothing tries to solve it.
     """
     if _safe_visible(page, ".cf-error-details, #cf-error-details"):
         if not is_cloudflare_access_block(page):
             return True
     text = _safe_title(page).lower() + " " + _page_text(page)
     if is_cloudflare_access_block(page):
+        return False
+    if CF_CHALLENGE_TITLE_RE.match(_safe_title(page).lower()):
+        # "Just a moment..." wins over any error wording a challenge may carry.
         return False
     return any(marker in text for marker in CF_ERROR_MARKERS)
 
@@ -1051,7 +1065,9 @@ def is_cloudflare_active(page) -> bool:
     if is_cloudflare_error_page(page):
         return False
     title = _safe_title(page).lower()
-    if title.startswith("just a moment") or "attention required! | cloudflare" in title:
+    if CF_CHALLENGE_TITLE_RE.match(title):
+        return True
+    if "attention required! | cloudflare" in title:
         return True
     if _safe_visible(page, "#challenge-stage, #challenge-running, #turnstile-wrapper"):
         return True
