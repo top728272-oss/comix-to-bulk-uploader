@@ -383,7 +383,8 @@ def make_cf_solver_hook(config: dict, log: Callable = print) -> Callable:
             result = solve_via_subprocess(
                 core.SITE_ROOT,
                 log=logger,
-                proxy=core.proxy_config(config),
+                # refresh_vpn=False: match the egress the running browser holds.
+                proxy=core.effective_proxy(config, refresh_vpn=False),
                 **_solver_kwargs(cf),
             )
             if not result.get("ok"):
@@ -428,7 +429,7 @@ def solve_into_config(config_store, log: Callable = print) -> bool:
     result = solve_via_subprocess(
         core.SITE_ROOT,
         log=log,
-        proxy=core.proxy_config(config_store.data),
+        proxy=core.effective_proxy(config_store.data, refresh_vpn=False),
         **_solver_kwargs(cf),
     )
     if not result.get("ok"):

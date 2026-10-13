@@ -12,6 +12,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
+try:
+    import urbproxy
+except ImportError:
+    urbproxy = None  # local-only VPN client; everything runs direct without it
+
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 PROFILE_DIR = (BASE_DIR / "browser_profile").resolve()
@@ -330,6 +335,22 @@ def proxy_config(config: dict) -> dict | None:
         if value:
             proxy[key] = str(value)
     return proxy
+
+
+def effective_proxy(config: dict, refresh_vpn: bool = True) -> dict | None:
+    """The proxy a new browser (or a solver run) should use.
+
+    The local, gitignored urbproxy.py wins while its VPN is active; otherwise
+    the config.json "proxy" block applies. The solver passes refresh_vpn=False
+    so it shares the token the running browser already holds (cf_clearance is
+    bound to the egress IP that earned it).
+    """
+    if urbproxy is not None and urbproxy.is_active():
+        try:
+            return urbproxy.playwright_proxy(refresh=refresh_vpn)
+        except Exception:
+            pass
+    return proxy_config(config)
 
 
 def set_config_cookies(config: dict, values: dict) -> bool:
@@ -836,9 +857,11 @@ def launch_context(
         args=args,
         ignore_default_args=["--enable-automation"],
         viewport={"width": 1280, "height": 900},
-        # None means "connect directly". When set, the solver must use the same
-        # egress or the clearance it mints is bound to the wrong IP.
-        proxy=proxy_config(config),
+        # None means "connect directly". effective_proxy returns the active
+        # UrbanVPN gateway when toggled on, else the config proxy. The solver
+        # must be given the same egress: cf_clearance is bound to the IP that
+        # earned it.
+        proxy=effective_proxy(config),
     )
 
     page = context.pages[0] if context.pages else context.new_page()

@@ -35,6 +35,11 @@ from core import (
 )
 from session import BrowserSession
 
+try:
+    import urbproxy
+except ImportError:
+    urbproxy = None  # local-only VPN client; the VPN button stays hidden without it
+
 STATUS_COLORS = {
     "pending": "#1f2933",
     "queued": "#1f2933",
@@ -86,6 +91,7 @@ class App(tk.Tk):
         self.active_chapters: set = set()
         self.done_count = 0
         self._run_state = "idle"
+        self._vpn_on = False
         self.search_results: list[dict] = []
         self.saved_series: list[dict] = sorted(
             self.library.get("series", []),
@@ -495,6 +501,12 @@ class App(tk.Tk):
         ttk.Button(
             card, text="Refresh Cloudflare", command=self.refresh_clearance, width=18
         ).pack(side="right")
+
+        if urbproxy is not None:
+            self.vpn_btn = ttk.Button(
+                card, text="VPN: off", command=self.toggle_vpn, width=9
+            )
+            self.vpn_btn.pack(side="right", padx=(0, 8))
 
         # Manual cookie paste for when refreshing will not clear the check.
         cookie_card = ttk.Frame(parent, style="Card.TFrame", padding=8)
@@ -1138,6 +1150,24 @@ class App(tk.Tk):
         self.append_log("[■] Stopping after the current chapter…")
         self.session.submit(("stop",))
 
+    def toggle_vpn(self) -> None:
+        if not urbproxy:
+            return
+        if self.run_active:
+            messagebox.showinfo("Busy", "Stop the run before toggling UrbanVPN.")
+            return
+        if self._vpn_on:
+            self.session.submit(("vpn_off",))
+            return
+        country = simpledialog.askstring(
+            "UrbanVPN",
+            "Exit country (ISO2 code like DE, blank = automatic):",
+            parent=self,
+        )
+        if country is None:
+            return
+        self.session.submit(("vpn_on", country.strip() or None))
+
     def resume_after_cf(self) -> None:
         self._hide_cf_banner()
         self.session.submit(("resume_cf",))
@@ -1319,6 +1349,11 @@ class App(tk.Tk):
         self.append_log(
             f"[✓] Cloudflare cleared on chapter {chapter} - resuming automatically."
         )
+
+    def _on_vpn_state(self, on) -> None:
+        self._vpn_on = bool(on)
+        if hasattr(self, "vpn_btn"):
+            self.vpn_btn.configure(text="VPN: on" if on else "VPN: off")
 
     def _on_run_state(self, state) -> None:
         self._run_state = state

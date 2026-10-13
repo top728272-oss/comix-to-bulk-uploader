@@ -29,6 +29,11 @@ from core import (
 from parallel import run_upload_batch_auto
 import solver
 
+try:
+    import urbproxy
+except ImportError:
+    urbproxy = None  # local-only VPN client; the VPN button hides without it
+
 
 class BrowserSession(threading.Thread):
     """Worker thread owning one Playwright persistent context."""
@@ -197,6 +202,14 @@ class BrowserSession(threading.Thread):
             self.page.goto(job[1], wait_until="domcontentloaded", timeout=60000)
             return
 
+        if kind == "vpn_on":
+            self._vpn_apply(job[1], True)
+            return
+
+        if kind == "vpn_off":
+            self._vpn_apply(None, False)
+            return
+
     # -- internals ---------------------------------------------------------
 
     def _log(self, message: str) -> None:
@@ -273,6 +286,25 @@ class BrowserSession(threading.Thread):
         self.page = None
         self._cdp_on = False
         self.cdp_endpoint = None
+
+    def _vpn_apply(self, country: str | None, want_on: bool) -> None:
+        if urbproxy is None:
+            self._log("[!] urbproxy.py not found - UrbanVPN routing is unavailable.")
+            self.emit("vpn_state", False)
+            return
+        try:
+            if want_on:
+                urbproxy.activate(country, log=self._log)
+            else:
+                urbproxy.deactivate(log=self._log)
+        except Exception as exc:
+            self._log(f"[!] UrbanVPN toggle failed: {exc}")
+        self.emit("vpn_state", urbproxy.is_active())
+        if self.context is not None:
+            # The proxy is a launch flag, so Chrome must restart to change egress.
+            self._log("[i] Restarting Chrome so it uses the new route...")
+            self._close_context()
+            self._ensure_browser()
 
     def _cf_resolved(self, restart: bool):
         """Called by the upload runner once Cloudflare has cleared."""

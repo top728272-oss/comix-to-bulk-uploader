@@ -37,4 +37,8 @@ collect.py
 collect_out/
 adult_scan.py
 adult_out/
+blacklist_ui.py
 analysis
+
+# Local-only UrbanVPN routing (reverse-engineered client, never distributed)
+urbproxy.py
