@@ -19,12 +19,12 @@ import core
 
 
 class VpnTunnelLimitTests(unittest.TestCase):
-    """The UrbanVPN gateway serves one concurrent tunnel, so worker tabs hang.
+    """Parallel tabs cannot authenticate through the UrbanVPN gateway.
 
-    A CONNECT tunnel stays open for the life of its tab, so a second tab never
-    gets an answer and sits on about:blank forever. Verified against the live
-    gateway: one tab plus the session page works, two worker tabs hang, and
-    staggering them does not help either.
+    Workers are driven over connect_over_cdp, which takes no proxy argument, so
+    those connections carry no credentials and the gateway's 407 handshake
+    stalls every worker tab on about:blank. Not a tunnel limit: four concurrent
+    CONNECT tunnels on one token all succeed at the socket level.
     """
 
     def setUp(self) -> None:
@@ -88,7 +88,7 @@ class VpnTunnelLimitTests(unittest.TestCase):
             core.run_upload_batch = saved
 
         self.assertEqual(calls, ["sequential"])
-        self.assertTrue(any("one tunnel at a time" in m for m in logs))
+        self.assertTrue(any("cannot authenticate" in m for m in logs))
 
 
 class UploadPacerTests(unittest.TestCase):

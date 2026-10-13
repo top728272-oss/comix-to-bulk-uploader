@@ -375,15 +375,20 @@ def vpn_gateway_active() -> bool:
 def effective_concurrency(config: dict) -> int:
     """Worker count this network can actually sustain.
 
-    The UrbanVPN gateway serves one concurrent tunnel per token, and a tunnel
-    stays open for the life of its tab. So the moment a second tab navigates,
-    the gateway never answers its CONNECT and that tab hangs on load - which
-    looked like parallel uploads silently stalling on blank tabs. Verified: one
-    tab plus the session page works, two worker tabs hang forever, and
-    staggering them does not help either.
+    Parallel workers are driven over ``connect_over_cdp``, which takes no proxy
+    argument - so those connections carry no gateway credentials. Chrome hits
+    the gateway's 407 and the auth handshake stalls, leaving every worker tab
+    parked on about:blank while the launch tab works fine. Measured: direct
+    connection, 2 worker tabs navigate in under a second each; behind the
+    gateway they never resolve.
 
-    One page is one tunnel, so the gateway means sequential uploads. A plain
-    ``config.proxy`` is not restricted this way.
+    It is NOT a gateway tunnel limit - four concurrent CONNECT tunnels on one
+    token all succeed at the socket level - and a second token would not help,
+    because the missing piece is credentials in the worker's connection rather
+    than the credential itself.
+
+    One page is one connection, so the gateway means sequential uploads. A
+    plain ``config.proxy`` is not affected and keeps its configured count.
     """
     try:
         n = validate_concurrency(config.get("concurrency", DEFAULT_CONCURRENCY))
