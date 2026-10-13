@@ -27,6 +27,7 @@ from core import (
     search_site,
     set_config_cookies,
     sync_cookies_from_context,
+    vpn_gateway_active,
 )
 from parallel import run_upload_batch_auto
 import solver
@@ -281,7 +282,11 @@ class BrowserSession(threading.Thread):
         self.emit("job_blocked", (context, vreq.kind))
 
     def _ensure_browser(self) -> None:
-        want_cdp = self.config.concurrency > 1
+        # CDP exists only so parallel workers can attach to this same browser.
+        # When the network cannot take them (one tunnel at a time through the
+        # UrbanVPN gateway) there is nothing to attach, and staying off CDP is
+        # also one less automation signal for Cloudflare to see.
+        want_cdp = self.config.concurrency > 1 and not vpn_gateway_active()
         if self.context is not None:
             if self._cdp_on == want_cdp:
                 try:

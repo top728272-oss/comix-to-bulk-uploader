@@ -55,6 +55,13 @@ def run_upload_batch_auto(page, endpoint, config: dict, params, **kwargs) -> Run
         log(f"[!] {ex}")
         n = 1
 
+    if n > 1 and core.vpn_gateway_active():
+        n = 1
+        log(
+            "[i] UrbanVPN serves one tunnel at a time, so parallel tabs would "
+            "hang on load - uploading sequentially on a single tab instead."
+        )
+
     # Optional pre-flight: mint a fresh Cloudflare clearance before the batch,
     # so a run does not stall on the first chapter. Never let it break a run.
     hook = kwargs.get("cf_solver_hook")

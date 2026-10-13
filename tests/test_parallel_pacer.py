@@ -15,6 +15,80 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import parallel
 from core import Control
+import core
+
+
+class VpnTunnelLimitTests(unittest.TestCase):
+    """The UrbanVPN gateway serves one concurrent tunnel, so worker tabs hang.
+
+    A CONNECT tunnel stays open for the life of its tab, so a second tab never
+    gets an answer and sits on about:blank forever. Verified against the live
+    gateway: one tab plus the session page works, two worker tabs hang, and
+    staggering them does not help either.
+    """
+
+    def setUp(self) -> None:
+        self._saved = core.urbproxy
+
+    def tearDown(self) -> None:
+        core.urbproxy = self._saved
+
+    @staticmethod
+    def _fake(active: bool):
+        class Fake:
+            @staticmethod
+            def is_active():
+                return active
+
+        return Fake
+
+    def test_gateway_forces_a_single_worker(self):
+        core.urbproxy = self._fake(True)
+        self.assertEqual(core.effective_concurrency({"concurrency": 5}), 1)
+
+    def test_without_the_gateway_the_configured_count_stands(self):
+        core.urbproxy = self._fake(False)
+        self.assertEqual(core.effective_concurrency({"concurrency": 5}), 5)
+
+    def test_a_plain_config_proxy_is_not_restricted(self):
+        # config.proxy is an ordinary proxy, not the single-tunnel gateway.
+        core.urbproxy = self._fake(False)
+        cfg = {"concurrency": 4, "proxy": {"server": "http://p:3128"}}
+        self.assertEqual(core.effective_concurrency(cfg), 4)
+
+    def test_absent_module_keeps_the_configured_count(self):
+        core.urbproxy = None
+        self.assertEqual(core.effective_concurrency({"concurrency": 3}), 3)
+
+    def test_invalid_concurrency_falls_back_to_one(self):
+        core.urbproxy = self._fake(False)
+        self.assertEqual(core.effective_concurrency({"concurrency": "nonsense"}), 1)
+
+    def test_engine_choice_is_sequential_under_the_gateway(self):
+        core.urbproxy = self._fake(True)
+        logs: list = []
+        calls: list = []
+
+        def fake_sequential(page=None, config=None, params=None, **kw):
+            calls.append("sequential")
+            return core.RunSummary()
+
+        saved = core.run_upload_batch
+        core.run_upload_batch = fake_sequential
+        try:
+            parallel.run_upload_batch_auto(
+                page=None,
+                endpoint="http://127.0.0.1:1",  # would be used if parallel
+                config={"concurrency": 5},
+                params=None,
+                log=logs.append,
+                control=Control(),
+            )
+        finally:
+            core.run_upload_batch = saved
+
+        self.assertEqual(calls, ["sequential"])
+        self.assertTrue(any("one tunnel at a time" in m for m in logs))
 
 
 class UploadPacerTests(unittest.TestCase):
