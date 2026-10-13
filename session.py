@@ -13,6 +13,7 @@ import traceback
 from playwright.sync_api import sync_playwright
 
 from core import (
+    AccessBlockedError,
     ConfigStore,
     Control,
     UploadParams,
@@ -22,6 +23,7 @@ from core import (
     launch_context,
     read_devtools_port,
     resolve_series_name,
+    rotate_vpn_egress,
     search_site,
     set_config_cookies,
     sync_cookies_from_context,
@@ -33,6 +35,11 @@ try:
     import urbproxy
 except ImportError:
     urbproxy = None  # local-only VPN client; the VPN button hides without it
+
+
+# How many exit IPs to try before reporting a Cloudflare IP ban. Matches the
+# cap urbproxy already uses for its own block-page retries.
+SEARCH_MAX_ROTATIONS = 3
 
 
 class BrowserSession(threading.Thread):
@@ -171,14 +178,7 @@ class BrowserSession(threading.Thread):
             return
 
         if kind == "search":
-            self._ensure_browser()
-            query = job[1]
-            try:
-                results = search_site(self.page, query, log=self._log)
-            except VerificationRequired as vreq:
-                self._report_blocked_job("search", vreq)
-                return
-            self.emit("search_results", results)
+            self._run_search(job[1])
             return
 
         if kind == "resolve":
@@ -214,6 +214,54 @@ class BrowserSession(threading.Thread):
 
     def _log(self, message: str) -> None:
         self.emit("log", str(message))
+
+    def _run_search(self, query: str) -> None:
+        """Search, solving Cloudflare and rotating a banned egress as needed.
+
+        search_site() handles a solvable challenge on its own. An egress IP ban
+        is different - no cookie clears it, and the only fix is a different
+        exit IP, so the loop here rotates the VPN, relaunches Chrome (the proxy
+        is a launch flag) and searches again. Bounded, then it gives up.
+        """
+        for attempt in range(1, SEARCH_MAX_ROTATIONS + 2):
+            self._ensure_browser()
+            try:
+                results = search_site(
+                    self.page,
+                    query,
+                    log=self._log,
+                    cf_solver_hook=solver.make_cf_solver_hook(
+                        self.config.data, self._log
+                    ),
+                )
+                self.emit("search_results", results)
+                return
+            except AccessBlockedError as blocked:
+                rotated = ""
+                if attempt <= SEARCH_MAX_ROTATIONS:
+                    self._log(
+                        f"[!] {blocked}. Rotating the VPN egress "
+                        f"({attempt}/{SEARCH_MAX_ROTATIONS})..."
+                    )
+                    if rotate_vpn_egress(self._log):
+                        # Chrome holds the old egress until it is relaunched.
+                        self._close_context()
+                        continue
+                    rotated = (
+                        " No alternative exit IP is available - switch the VPN "
+                        "off or pick another country."
+                    )
+                else:
+                    rotated = (
+                        f" Already rotated {SEARCH_MAX_ROTATIONS} time(s) without "
+                        "a working exit IP."
+                    )
+                self._log(f"[!] {blocked}.{rotated}")
+                self.emit("job_blocked", ("search", blocked.kind))
+                return
+            except VerificationRequired as vreq:
+                self._report_blocked_job("search", vreq)
+                return
 
     def _report_blocked_job(self, context: str, vreq: VerificationRequired) -> None:
         """A search or name lookup ran into a verification screen.

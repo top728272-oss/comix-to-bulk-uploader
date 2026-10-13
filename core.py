@@ -362,6 +362,23 @@ def effective_proxy(config: dict, refresh_vpn: bool = True) -> dict | None:
     return proxy_config(config)
 
 
+def rotate_vpn_egress(log: Callable = print) -> bool:
+    """Move the VPN to a different egress after this IP was banned.
+
+    False when there is no VPN, no alternative gateway, or the rotation failed.
+    The caller must relaunch the browser afterwards: the proxy is a launch
+    flag, so a running Chrome keeps the old egress no matter what we mint here.
+    """
+    if urbproxy is None or not urbproxy.is_active():
+        return False
+    try:
+        blocked = {urbproxy.current_ip()} - {""}
+        return bool(urbproxy.rotate_egress(avoid=blocked, log=log))
+    except Exception as ex:
+        log(f"[!] Could not rotate the VPN egress: {ex}")
+        return False
+
+
 def set_config_cookies(config: dict, values: dict) -> bool:
     """Update (or append) named cookies in ``config`` and save it.
 
@@ -1501,18 +1518,91 @@ def wait_for_challenge_clear(
 # Site search (runs through the real browser: the API needs a per-request token)
 # --------------------------------------------------------------------------
 
+# One attempt is a navigation plus a 10 s wait for the popup, so this is bounded
+# to well under a minute even when every attempt has to be solved.
+SEARCH_MAX_ATTEMPTS = 3
+# The popup intermittently renders nothing at all. Only the missing markup
+# separates that from a query that genuinely has no matches, so an unmarked
+# empty result is retried this many times before being believed.
+SEARCH_RENDER_RETRIES = 2
 
-def search_site(page, query: str, limit: int = 15, log: Callable | None = None):
+
+class _SearchRenderTimeout(RuntimeError):
+    """The results popup rendered neither results nor its empty-state marker."""
+
+
+def search_site(
+    page,
+    query: str,
+    limit: int = 15,
+    log: Callable | None = None,
+    *,
+    cf_solver_hook: Callable | None = None,
+    max_attempts: int = SEARCH_MAX_ATTEMPTS,
+):
     """Use the site's own search box and scrape the rendered result list.
 
     Returns a list of dicts: {hid, name, type, chapters, rating, url}
+
+    ``cf_solver_hook`` is the engine's ``(context, log) -> bool`` Cloudflare
+    solver. When a challenge blocks the search it is called and the search is
+    retried, so a gated query resolves itself instead of asking for a human.
+
+    An egress IP ban (``AccessBlockedError``) is deliberately NOT solved: no
+    cookie clears it, so it propagates for the caller to rotate the VPN or
+    report the ban.
     """
     query = (query or "").strip()
     if not query:
         return []
+    logger = log if log is not None else (lambda _message: None)
+    attempts = max(1, int(max_attempts or 1))
+    render_retries = 0
 
+    for attempt in range(1, attempts + 1):
+        try:
+            return _search_site_once(page, query, limit, logger)
+        except AccessBlockedError:
+            # Terminal for this IP. Let the caller rotate the egress.
+            raise
+        except VerificationRequired as vreq:
+            if cf_solver_hook is None or attempt >= attempts:
+                raise
+            logger(
+                f"[i] Cloudflare blocked the search - running the solver "
+                f"(attempt {attempt}/{attempts})."
+            )
+            try:
+                solved = bool(cf_solver_hook(page.context, logger))
+            except Exception as ex:
+                logger(f"[!] Cloudflare solver failed: {ex}")
+                solved = False
+            if not solved:
+                raise vreq
+        except _SearchRenderTimeout:
+            render_retries += 1
+            if attempt >= attempts or render_retries >= SEARCH_RENDER_RETRIES:
+                logger(
+                    "[i] The search popup never rendered - treating it as no "
+                    "results."
+                )
+                return []
+            logger(
+                f"[i] The search popup did not render - retrying "
+                f"({attempt}/{attempts})."
+            )
+
+    return []
+
+
+def _search_site_once(page, query: str, limit: int, log: Callable):
+    """One navigation plus one popup render. Raises rather than returning [] on
+    a gate, so ``search_site`` can tell "blocked" apart from "no matches"."""
     page.goto(SITE_ROOT, wait_until="domcontentloaded", timeout=60000)
     page.wait_for_timeout(800)
+    # Before the challenge check: a ban is terminal for this IP and must not be
+    # reported as a solvable verification screen.
+    _raise_if_access_blocked(page)
     require_no_challenge(
         page, "A verification screen blocked the site while searching."
     )
@@ -1541,11 +1631,15 @@ def search_site(page, query: str, limit: int = 15, log: Callable | None = None):
             ".search-pop__item--result, .search-pop__empty", timeout=10000
         )
     except Exception:
+        # The popup's own request can be gated or blocked while the document
+        # still looks perfectly fine, so re-check both here.
+        _raise_if_access_blocked(page)
         kind = detect_challenge(page)
         if kind:
             raise _exception_for(
                 kind, "A verification screen blocked the site while searching."
             )
+        raise _SearchRenderTimeout(query)
     page.wait_for_timeout(600)
 
     # The one deliberate un-bounded read: eval_on_selector_all takes no timeout,

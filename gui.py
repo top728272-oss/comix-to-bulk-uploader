@@ -1241,12 +1241,17 @@ class App(tk.Tk):
         self._load_saved_series()
 
     def _on_job_blocked(self, payload) -> None:
-        """A search or name lookup was stopped by a verification screen.
+        """A search or name lookup was stopped by Cloudflare.
 
-        The worker already left the browser sitting on the challenge; all this
-        does is tell the user how to proceed once they've solved it.
+        A solvable challenge leaves the browser sitting on the check, so the
+        user can clear it and retry. An egress IP ban has nothing to clear -
+        the session already tried rotating the exit IP - so it gets its own
+        wording instead of pointing at a captcha that does not exist.
         """
         context, kind = payload
+        if kind == "access_blocked":
+            self._on_access_blocked(context)
+            return
         label = "Cloudflare challenge"
         if context == "search":
             self.search_status.configure(
@@ -1268,6 +1273,16 @@ class App(tk.Tk):
                 f"[i] Solve the {label} in the Chrome window, then re-pick the "
                 "series (or paste its URL again) to load its name."
             )
+
+    def _on_access_blocked(self, context: str) -> None:
+        """Cloudflare banned the exit IP outright - no cookie can clear it."""
+        message = (
+            "Cloudflare blocked this IP outright and no cookie can clear it. "
+            "Switch the VPN off, pick another exit country, or try again later."
+        )
+        if context == "search":
+            self.search_status.configure(text=message)
+        self.append_log(f"[!] {message}")
 
     def _on_chapter_status(self, payload) -> None:
         key, status, detail = payload
