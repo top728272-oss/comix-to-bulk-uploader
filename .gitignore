@@ -39,3 +39,6 @@ _local/
 # Local-only UrbanVPN routing (reverse-engineered client, never distributed).
 # Stays at the root: core.py / gui.py / session.py import it.
 urbproxy.py
+
+# Cached UrbanVPN gateway credentials minted by urbproxy.py.
+urbproxy_tokens.json
