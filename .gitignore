@@ -32,13 +32,10 @@ series_library.json
 # Tooling cache
 .ruff_cache/
 
-# Read-only collector (standalone, intentionally untracked)
-collect.py
-collect_out/
-adult_scan.py
-adult_out/
-blacklist_ui.py
-analysis
+# Personal tooling (standalone, intentionally untracked). Holds the read-only
+# collector/adult scanner, their reports, and the browserless signing sidecar.
+_local/
 
-# Local-only UrbanVPN routing (reverse-engineered client, never distributed)
+# Local-only UrbanVPN routing (reverse-engineered client, never distributed).
+# Stays at the root: core.py / gui.py / session.py import it.
 urbproxy.py
