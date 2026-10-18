@@ -3,3 +3,6 @@ playwright>=1.40.0
 # avoids the CDP Runtime.enable signal that Cloudflare detects on the uploader's
 # Playwright-driven Chrome. Drives the system Chrome (channel="chrome").
 patchright>=1.63.0
+# Decrypts the envelope-encrypted app APIs (mimei, JM Comic) that
+# _local/adult_scan.py enumerates. Optional for the uploader itself.
+cryptography>=42.0.0
