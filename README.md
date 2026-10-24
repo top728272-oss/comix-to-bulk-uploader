@@ -1,5 +1,13 @@
 # Comix Uploader
 
+> **Development halted - comix.to has added bulk uploads.**
+> With its 2026-10 upload page redesign, comix.to shipped a built-in **bulk
+> upload** mode: drop many chapter archives at once, set the chapter number,
+> volume and title per file, and upload them as a queue. That is exactly what
+> this project was built to do, so its development is halted as of
+> 2026-10-24. The uploader below is kept as-is: it still works for the flows it
+> documents, but for anything batch-sized, use comix's own bulk uploader.
+
 Batch chapter uploader for comix.to - now with a desktop GUI so you stop
 re-pasting the same URL, folder, group name and title pattern every run.
 
