@@ -1140,5 +1140,305 @@ class AttachUploadFileTests(unittest.TestCase):
         self.assertTrue(session.detached)
 
 
+class UploadFormReadyFakePage:
+    """The redesigned upload page: both modes' inputs in the DOM at once.
+
+    ``selectors`` maps a selector (or a distinctive substring of one) to its
+    visibility, exactly like FakeChallengePage - what is new here is that the
+    single-chapter form can be HIDDEN while the bulk row is live, which is
+    the state that made the old first-match wait time out.
+    """
+
+    def __init__(self, selectors=None, attributes=None):
+        self._selectors = selectors or {}
+        self._attributes = attributes or {}
+        self.url = "https://comix.to/user/upload/123"
+        self.context = FakeContext()
+        self.waited = 0
+
+    def title(self):
+        return "Upload chapter"
+
+    def wait_for_timeout(self, ms):
+        self.waited += ms
+
+    def locator(self, selector):
+        for key, visible in self._selectors.items():
+            if key in selector:
+                loc = FakeLocator(visible=visible)
+                loc._attributes = self._attributes
+                return loc
+        loc = FakeLocator(visible=False)
+        loc._attributes = self._attributes
+        return loc
+
+
+class RedesignedUploadFormTests(unittest.TestCase):
+    """The 2026-10 upload page redesign broke the form wait and the field
+    selectors; these pin the replacements down."""
+
+    def test_first_visible_locator_skips_the_hidden_mode(self):
+        page = UploadFormReadyFakePage(
+            selectors={
+                ".upage-field:has-text('Chapter number') input": False,
+                "input[aria-label^='Chapter number of']": True,
+            }
+        )
+
+        found = core._first_visible_locator(page, core.CHAPTER_INPUT_SELECTORS)
+
+        self.assertIsNotNone(found)
+        self.assertTrue(found.is_visible())
+
+    def test_first_visible_locator_returns_none_when_all_hidden(self):
+        page = UploadFormReadyFakePage(
+            selectors={
+                ".upage-field:has-text('Chapter number') input": False,
+                "input[aria-label^='Chapter number of']": False,
+                ".ubulk-cell--number input": False,
+            }
+        )
+
+        self.assertIsNone(core._first_visible_locator(page, core.CHAPTER_INPUT_SELECTORS))
+
+    def test_form_wait_accepts_any_visible_signal(self):
+        """The old wait took the FIRST match; the drop zone alone must do."""
+        page = UploadFormReadyFakePage(selectors={".upage-drop": True})
+
+        core._wait_for_upload_form(page, timeout_ms=200)
+
+    def test_form_wait_ignores_hidden_inputs_of_the_inactive_mode(self):
+        page = UploadFormReadyFakePage(
+            selectors={
+                ".upage-field:has-text('Chapter number') input": False,
+                "input[aria-label^='Chapter number of']": True,
+            }
+        )
+
+        core._wait_for_upload_form(page, timeout_ms=200)
+
+    def test_form_wait_reports_what_the_page_offered(self):
+        page = UploadFormReadyFakePage(selectors={})
+
+        with self.assertRaises(RuntimeError) as ctx:
+            core._wait_for_upload_form(page, timeout_ms=50)
+
+        self.assertIn("did not render", str(ctx.exception))
+
+    def test_single_tab_clicked_only_when_bulk_is_selected(self):
+        class TabLocator(FakeLocator):
+            def __init__(self, selected):
+                super().__init__(visible=True)
+                self._selected = selected
+                self.clicks = 0
+
+            def get_attribute(self, name, timeout=None):
+                return self._selected if name == "aria-selected" else None
+
+            def click(self, timeout=None):
+                self.clicks += 1
+
+        class TabPage(UploadFormReadyFakePage):
+            def __init__(self, selected):
+                super().__init__(
+                    selectors={core.SINGLE_CHAPTER_TAB_SELECTOR: True},
+                    attributes={"aria-selected": selected},
+                )
+                self._tab = TabLocator(selected)
+
+            def locator(self, selector):
+                if core.SINGLE_CHAPTER_TAB_SELECTOR in selector:
+                    return self._tab
+                return super().locator(selector)
+
+        bulk = TabPage("false")
+        core._prefer_single_chapter_form(bulk)
+        self.assertEqual(bulk._tab.clicks, 1)
+
+        single = TabPage("true")
+        core._prefer_single_chapter_form(single)
+        self.assertEqual(single._tab.clicks, 0)
+
+    def test_file_input_resolves_to_the_visible_drop_zone(self):
+        """The bulk section keeps two file inputs mounted while hidden, so the
+        attach must go to the live mode's input."""
+        single = UploadFormReadyFakePage(
+            selectors={"form.cpost-form label.upage-drop": True}
+        )
+        _, selector = core._resolve_file_input(single)
+        self.assertEqual(selector, "form.cpost-form input.upage-drop__input")
+
+        bulk = UploadFormReadyFakePage(
+            selectors={".ubulk label.upage-drop": True}
+        )
+        _, selector = core._resolve_file_input(bulk)
+        self.assertEqual(
+            selector, "input.upage-drop__input[data-bulk-input='files']"
+        )
+
+    def test_upload_form_detector_sees_past_the_hidden_bulk_section(self):
+        """A Turnstile marker on the real upload form must not read as a
+        Cloudflare challenge - the detector has to find the visible form."""
+
+        class ExactPage(FakeChallengePage):
+            """Matches selectors exactly, so a probe for the drop zone is not
+            answered by the (hidden) bulk section's field wrapper."""
+
+            def locator(self, selector):
+                if selector in ("body", "title", "html"):
+                    return super().locator(selector)
+                for key, visible in self._selectors.items():
+                    if key == selector:
+                        return FakeLocator(visible=visible)
+                return FakeLocator(visible=False)
+
+        form_page = ExactPage(
+            title="Upload chapter",
+            body="<div class='cf-turnstile'></div>",
+            selectors={".upage-drop": True},
+        )
+        self.assertTrue(core._looks_like_upload_form(form_page))
+        self.assertFalse(core.is_cloudflare_active(form_page))
+
+        bare = ExactPage(
+            title="Upload chapter",
+            body="<div class='cf-turnstile'></div>",
+            selectors={".upage-field": True},  # hidden bulk section only
+        )
+        self.assertFalse(core._looks_like_upload_form(bare))
+
+
+class FakeResponse:
+    def __init__(self, url, status=200, method="GET", retry_after=None):
+        self.url = url
+        self.status = status
+
+        class _Req:
+            pass
+
+        self.request = _Req()
+        self.request.method = method
+        self.headers = {"retry-after": retry_after} if retry_after else {}
+
+
+class SubmitAndFailureTextTests(unittest.TestCase):
+    """Submit resolution and failure text on the redesigned page."""
+
+    class SubmitPage(UploadFormReadyFakePage):
+        def __init__(self, form_visible, submit_text, bulk_text=None):
+            super().__init__(selectors={})
+            self._form_visible = form_visible
+            self._submit_text = submit_text
+            self._bulk_text = bulk_text
+
+        def locator(self, selector):
+            if "form.cpost-form" in selector:
+                return FakeLocator(visible=self._form_visible)
+            if "[data-bulk-start]" in selector:
+                loc = FakeLocator(
+                    visible=self._bulk_text is not None, text=self._bulk_text or ""
+                )
+                loc.wait_for = lambda **kw: None
+                return loc
+            if "button[type='submit']" in selector or "Submit upload" in selector:
+                return FakeLocator(
+                    visible=self._submit_text is not None, text=self._submit_text or ""
+                )
+            return FakeLocator(visible=False)
+
+    def test_submit_resolves_to_the_single_form_button(self):
+        page = self.SubmitPage(form_visible=True, submit_text="Submit upload")
+
+        btn = core._resolve_submit_button(page)
+
+        self.assertEqual(btn.inner_text(), "Submit upload")
+
+    def test_submit_resolves_to_the_bulk_queue_start(self):
+        page = self.SubmitPage(form_visible=False, submit_text=None, bulk_text="Upload 1 more")
+
+        btn = core._resolve_submit_button(page)
+
+        self.assertEqual(btn.inner_text(), "Upload 1 more")
+
+    def test_failure_text_reads_the_error_toast(self):
+        class ToastPage:
+            def locator(self, selector):
+                if ".toast--error" not in selector:
+                    return FakeLocator(visible=False)
+                return FakeLocator(visible=True, text="chunk 3-4 refused with HTTP 500")
+
+        self.assertEqual(
+            core._upload_failure_text(ToastPage()),
+            "chunk 3-4 refused with HTTP 500",
+        )
+
+    def test_failure_text_ignores_a_clean_page(self):
+        page = UploadFormReadyFakePage(selectors={})
+
+        self.assertIsNone(core._upload_failure_text(page))
+
+
+class UploadResponseTrackerTests(unittest.TestCase):
+    """Chunk PUTs no longer travel under /upload/chunk, so progress - and
+    with it the stall watchdog - must not depend on that path."""
+
+    def test_any_put_counts_as_chunk_progress(self):
+        tracker, on_response = core._make_response_tracker()
+        before = tracker["last_activity"]
+
+        # A refused chunk still proves the upload is alive...
+        on_response(
+            FakeResponse("https://comix.to/api/v1/uploads/abc123", status=500, method="PUT")
+        )
+        # ...and a server-provided chunk URL with no /upload/chunk in it counts.
+        on_response(
+            FakeResponse("https://uploads.example.com/chunk", status=200, method="PUT")
+        )
+
+        self.assertEqual(tracker["chunks_done"], 1)
+        self.assertGreaterEqual(tracker["last_activity"], before)
+
+    def test_finalize_response_still_marks_the_upload_done(self):
+        tracker, on_response = core._make_response_tracker()
+
+        on_response(
+            FakeResponse(
+                "https://comix.to/api/v1/uploads/abc123/finalize", method="POST"
+            )
+        )
+
+        self.assertTrue(tracker["finalized"])
+
+    def test_init_response_alone_does_not_finalize(self):
+        tracker, on_response = core._make_response_tracker()
+
+        on_response(FakeResponse("https://comix.to/api/v1/uploads/init", method="POST"))
+
+        self.assertFalse(tracker["finalized"])
+
+    def test_blocked_and_server_down_still_classified(self):
+        tracker, on_response = core._make_response_tracker()
+
+        on_response(FakeResponse("https://comix.to/api/v1/uploads/init", status=403))
+        self.assertTrue(tracker["blocked"])
+        self.assertFalse(tracker["server_down"])
+
+        tracker2, on_response2 = core._make_response_tracker()
+        on_response2(FakeResponse("https://comix.to/api/v1/uploads/init", status=502))
+        self.assertTrue(tracker2["server_down"])
+        self.assertFalse(tracker2["blocked"])
+
+    def test_rate_limit_keeps_retry_after(self):
+        tracker, on_response = core._make_response_tracker()
+
+        on_response(
+            FakeResponse(
+                "https://comix.to/api/v1/uploads/init", status=429, retry_after="30"
+            )
+        )
+
+        self.assertEqual(tracker["retry_after"], 30.0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -143,20 +143,69 @@ FILE_PROBE_INSTALL_JS = """
 """
 
 # Returns "accepted" | "empty" | "gone". Run via a locator handle, which calls
-# ``(element, arg)``, so the selector is inlined rather than passed in.
+# ``(element, arg)``, so the selector arrives as the second argument and the
+# caller decides which mode's input to probe.
 FILE_PROBE_STATE_JS = """
-() => {
+(_, sel) => {
   if (window.__comixFileProbe === 1) return 'accepted';
-  const input = document.querySelector(%s);
+  const input = document.querySelector(sel);
   if (!input) return 'gone';
   if (input.files && input.files.length > 0) return 'accepted';
   return 'empty';
 }
-""" % json.dumps(FILE_INPUT_SELECTOR)
+"""
 
 # How long to wait for the page to acknowledge the file.
 FILE_PROBE_POLL_TRIES = 10
 FILE_PROBE_POLL_SECONDS = 0.2
+
+# The upload page was redesigned (2026-10) into a React form with two modes:
+# the single-chapter form (the default) wraps every control in a
+# ``.upage-field`` whose label names it, while the bulk mode gives each
+# dropped file a ``ubulk-cell`` row addressed by aria-label. BOTH modes stay
+# mounted with the inactive one hidden, and the bulk section comes first in
+# the DOM - so a plain ``.first`` (or ``wait_for_selector``, which only waits
+# for the first match) lands on a hidden element. Every lookup below either
+# probes each candidate for visibility or filters with ``>> visible=true``.
+CHAPTER_INPUT_SELECTORS = (
+    ".upage-field:has-text('Chapter number') input",
+    "input[aria-label^='Chapter number of']",
+    ".ubulk-cell--number input",
+)
+TITLE_INPUT_SELECTORS = (
+    ".upage-field:has-text('Chapter title') input",
+    "input[aria-label^='Title of']",
+    ".ubulk-cell--title input",
+)
+# Any of these visible means the form finished rendering. The file input
+# itself cannot be the signal: the redesign styles it ``display:none``.
+UPLOAD_FORM_READY_SELECTORS = (
+    ".upage-drop",
+    ".upage-field:has-text('Chapter number') input",
+    "input[aria-label^='Chapter number of']",
+)
+GROUP_INPUT_SELECTOR = "input[placeholder*='Search a group'] >> visible=true"
+OFFICIAL_TOGGLE_SELECTOR = "input.upage-toggle__input >> visible=true"
+SUBMIT_BUTTON_SELECTORS = (
+    "button[type='submit']",
+    "button:has-text('Submit upload')",
+    "[data-bulk-start]",  # bulk mode starts its queue with this, not a submit
+)
+SINGLE_CHAPTER_TAB_SELECTOR = "button[role='tab']:has-text('Single chapter')"
+# (visible drop zone, the file input inside it). The input is display:none,
+# so the zone decides which mode is live; the bulk section keeps two file
+# inputs mounted while hidden and a first-match attach would hand the file
+# to those.
+FILE_DROP_ZONE_PAIRS = (
+    (
+        "form.cpost-form label.upage-drop",
+        "form.cpost-form input.upage-drop__input",
+    ),
+    (
+        ".ubulk label.upage-drop",
+        "input.upage-drop__input[data-bulk-input='files']",
+    ),
+)
 
 
 class VerificationRequired(Exception):
@@ -1067,8 +1116,13 @@ def _looks_like_upload_form(page) -> bool:
     """True when the real comix upload form is rendered on this tab.
 
     Keeps the generic Turnstile markers from flagging comix's own widget.
+    Both redesigned modes (single-chapter form, bulk queue) expose a visible
+    drop zone; the inactive mode's inputs stay in the DOM hidden, so a
+    first-match probe on ``.upage-field`` would miss the form entirely.
     """
-    return _safe_visible(page, ".upage-field, input.upage-drop__input")
+    return _safe_visible(page, ".upage-drop") or _safe_visible(
+        page, ".upage-field:has-text('Chapter number') input"
+    )
 
 
 def is_cloudflare_active(page) -> bool:
@@ -1844,7 +1898,9 @@ class Control:
         return self.abort_event.is_set()
 
 
-def attach_upload_file(page, file_input, file_path, log: Callable = print) -> None:
+def attach_upload_file(
+    page, file_input, file_path, log: Callable = print, selector: str = FILE_INPUT_SELECTOR
+) -> None:
     """Attach the archive to the upload form's file input.
 
     Uses plain CDP (``DOM.setFileInputFiles``) rather than
@@ -1854,6 +1910,8 @@ def attach_upload_file(page, file_input, file_path, log: Callable = print) -> No
     stays as a fallback. Success is judged by the page's own ``change`` event
     (comix replaces the drop-zone input as soon as it has the file, so reading
     the input back would look like a failure).
+
+    ``selector`` must address the LIVE mode's input - see FILE_DROP_ZONE_PAIRS.
     """
     # Same waiting behaviour the locator action had: the form may still be
     # rendering when we get here.
@@ -1862,7 +1920,7 @@ def attach_upload_file(page, file_input, file_path, log: Callable = print) -> No
     except Exception:
         pass  # the attach attempts below will produce the real error
 
-    if _attach_via_cdp(page, file_path, log):
+    if _attach_via_cdp(page, file_path, log, selector):
         return
     # The standard route is the slow one on a worker connection (~16 s), so it
     # gets a longer budget than the default 30 s instead of a coin flip.
@@ -1870,7 +1928,7 @@ def attach_upload_file(page, file_input, file_path, log: Callable = print) -> No
     file_input.set_input_files(str(file_path), timeout=60000)
 
 
-def _attach_via_cdp(page, file_path, log: Callable) -> bool:
+def _attach_via_cdp(page, file_path, log: Callable, selector: str) -> bool:
     """Set the file input with ``DOM.setFileInputFiles``.
 
     True when the page took the file (or the form consumed the input, which
@@ -1887,7 +1945,7 @@ def _attach_via_cdp(page, file_path, log: Callable) -> bool:
         doc = session.send("DOM.getDocument", {"depth": 0})
         node = session.send(
             "DOM.querySelector",
-            {"nodeId": doc["root"]["nodeId"], "selector": FILE_INPUT_SELECTOR},
+            {"nodeId": doc["root"]["nodeId"], "selector": selector},
         )
         node_id = node.get("nodeId") if node else 0
         if not node_id:
@@ -1902,7 +1960,7 @@ def _attach_via_cdp(page, file_path, log: Callable) -> bool:
         gone_reads = 0
         state = ""
         for _ in range(FILE_PROBE_POLL_TRIES):
-            state = _bounded_eval(page, FILE_PROBE_STATE_JS)
+            state = _bounded_eval(page, FILE_PROBE_STATE_JS, selector)
             if state == "accepted":
                 return True
             if state == "gone":
@@ -1937,12 +1995,12 @@ def _fill_group(
     if not group_name:
         return
 
-    group_input = page.locator(
-        ".upage-field input[placeholder*='group'], input[placeholder*='Search a group']"
-    ).first
+    # The bulk section mounts its own group picker while hidden and comes
+    # first in the DOM, so only the visible one may be driven.
+    group_input = page.locator(GROUP_INPUT_SELECTOR).first
 
     for _attempt in range(1, 4):
-        picked_el = page.locator(".upage-group--picked")
+        picked_el = page.locator(".upage-group--picked >> visible=true")
         try:
             if picked_el.is_visible(timeout=SAFE_READ_TIMEOUT_MS):
                 if (
@@ -1950,7 +2008,7 @@ def _fill_group(
                     in picked_el.inner_text(timeout=SAFE_READ_TIMEOUT_MS).lower()
                 ):
                     return
-                clear_btn = page.locator(".upage-group__clear")
+                clear_btn = page.locator(".upage-group__clear >> visible=true")
                 if clear_btn.is_visible(timeout=SAFE_READ_TIMEOUT_MS):
                     clear_btn.click(force=True)
                     page.wait_for_timeout(500)
@@ -1973,7 +2031,7 @@ def _fill_group(
             group_input.press_sequentially(group_name, delay=90)
 
             group_item = (
-                page.locator("button.upage-group__item")
+                page.locator("button.upage-group__item >> visible=true")
                 .filter(has_text=group_name)
                 .first
             )
@@ -1999,7 +2057,8 @@ def _fill_group(
         _bounded_eval(
             page,
             """(_el, name) => {
-            const btns = Array.from(document.querySelectorAll('button.upage-group__item'));
+            const btns = Array.from(document.querySelectorAll('button.upage-group__item'))
+                .filter(b => b.offsetParent !== null);
             const match = btns.find(b => b.textContent.toLowerCase().includes(name));
             if (match) match.click();
         }""",
@@ -2009,7 +2068,7 @@ def _fill_group(
         pass
     page.wait_for_timeout(1000)
     try:
-        if page.locator(".upage-group--picked").is_visible(
+        if page.locator(".upage-group--picked >> visible=true").is_visible(
             timeout=SAFE_READ_TIMEOUT_MS
         ):
             log(f"[✓] Group '{group_name}' selected via DOM fallback.")
@@ -2041,6 +2100,181 @@ def _retry_after_seconds(res) -> float | None:
         return max(0.0, parsedate_to_datetime(raw).timestamp() - time.time())
     except Exception:
         return None
+
+
+def _first_visible_locator(page, selectors, timeout_ms: int = SAFE_READ_TIMEOUT_MS):
+    """First locator among ``selectors`` that is visible right now, else None.
+
+    Each candidate is probed on its own: the redesigned upload page keeps the
+    inactive mode's inputs in the DOM, so a single comma selector resolves to
+    hidden elements as readily as to the live ones.
+    """
+    for selector in selectors:
+        locator = page.locator(selector).first
+        try:
+            if locator.is_visible(timeout=timeout_ms):
+                return locator
+        except Exception:
+            continue
+    return None
+
+
+def _wait_for_upload_form(page, timeout_ms: int = 15000) -> None:
+    """Block until the upload form has rendered something fillable.
+
+    Replaces a bare ``wait_for_selector(".upage-field input")``: that only
+    ever waits for the FIRST match, and on the redesigned page the first
+    match can be an input the inactive mode keeps hidden - which is how
+    every chapter came to time out here. Any visible form signal counts,
+    and a timeout reports what the page actually offered.
+    """
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    while True:
+        if _first_visible_locator(page, UPLOAD_FORM_READY_SELECTORS, timeout_ms=750):
+            return
+        if time.monotonic() >= deadline:
+            break
+        page.wait_for_timeout(250)
+
+    kind = detect_challenge(page)
+    if kind:
+        raise _exception_for(kind, "A verification screen blocked the upload form.")
+    _raise_if_access_blocked(page)
+    seen = _bounded_eval(
+        page,
+        "() => Array.from(document.querySelectorAll('input'))"
+        ".map(e => (e.placeholder || e.getAttribute('aria-label') || e.type)"
+        " + (e.offsetParent === null ? ' [hidden]' : '')).slice(0, 12)",
+    )
+    raise RuntimeError(
+        "The comix upload form did not render (no visible chapter field or "
+        f"drop zone). Inputs seen: {seen}"
+    )
+
+
+def _prefer_single_chapter_form(page) -> None:
+    """Switch the bulk tab back to the single-chapter form when it is active.
+
+    Bulk mode turns the page into a multi-row queue whose batch settings lock
+    once a file is added and whose rows are validated against the site before
+    upload - the fill flow drives the single form, so make sure that is the
+    active one. Failure is harmless: the field lookups cover both modes.
+    """
+    tab = page.locator(SINGLE_CHAPTER_TAB_SELECTOR).first
+    try:
+        if not tab.is_visible(timeout=SAFE_READ_TIMEOUT_MS):
+            return
+        if tab.get_attribute("aria-selected") == "true":
+            return
+        tab.click(timeout=5000)
+        page.wait_for_timeout(500)
+    except Exception:
+        pass
+
+
+def _make_response_tracker(on_chunk=None):
+    """Response classifier for one chapter's upload: (tracker, on_response).
+
+    The redesigned page PUTs its chunks to a server-provided URL that no
+    longer contains "/upload/chunk" - any PUT counts as progress, or a
+    healthy long upload reads as "stalled" and gets failed. Session
+    creation/finalize still travel under /api/v1/uploads.
+    """
+    tracker = {
+        "finalized": False,
+        "error": None,
+        "blocked": False,
+        "server_down": False,
+        "last_activity": time.time(),
+        "chunks_done": 0,
+        "retry_after": None,
+    }
+
+    def on_response(res):
+        res_url = res.url
+        low = res_url.lower()
+        method = (res.request.method or "").upper()
+        if method == "PUT":
+            tracker["last_activity"] = time.time()
+            if res.status == 200:
+                tracker["chunks_done"] += 1
+                if on_chunk:
+                    on_chunk(tracker["chunks_done"])
+        elif "/api/v1/uploads" in low:
+            tracker["last_activity"] = time.time()
+            if "finalize" in low and res.status == 200:
+                tracker["finalized"] = True
+            elif res.status in (403, 503):
+                tracker["blocked"] = True
+                tracker["error"] = f"Upload API blocked (HTTP {res.status})"
+            elif res.status in (500, 502, 503, 504):
+                # Origin failing, not the account: flag server-down, not challenge.
+                tracker["server_down"] = True
+                tracker["error"] = f"HTTP {res.status} on {res_url}"
+            elif res.status == 429:
+                tracker["error"] = f"HTTP {res.status} on {res_url}"
+                # Remember Retry-After so the retry backs off deliberately.
+                tracker["retry_after"] = _retry_after_seconds(res)
+
+    return tracker, on_response
+
+
+def _resolve_file_input(page):
+    """(locator, selector) for the LIVE mode's file input.
+
+    The input itself is ``display:none`` in both modes, so the visible drop
+    zone says which mode is live. The bulk section keeps two file inputs
+    mounted while hidden and precedes the form in the DOM, so a first-match
+    attach would hand the archive to those instead.
+    """
+    for zone, selector in FILE_DROP_ZONE_PAIRS:
+        try:
+            if page.locator(zone).first.is_visible(timeout=SAFE_READ_TIMEOUT_MS):
+                return page.locator(selector).first, selector
+        except Exception:
+            continue
+    return page.locator(FILE_INPUT_SELECTOR).first, FILE_INPUT_SELECTOR
+
+
+def _upload_failure_text(page) -> str | None:
+    """The page's own error message for a failed upload, if it showed one.
+
+    The redesigned form toasts the engine's reason ("chunk 3-4 refused with
+    HTTP 500"), which is far more use in the failure record than a generic
+    line - but only real error toasts count, never the informational notes.
+    """
+    try:
+        el = page.locator(".toast--error .toast__text, .toast--error").first
+        if el.is_visible(timeout=SAFE_READ_TIMEOUT_MS):
+            return el.inner_text(timeout=SAFE_READ_TIMEOUT_MS).strip() or None
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_submit_button(page):
+    """The submit control of the live upload mode.
+
+    Single mode has one ``button[type=submit]``. Bulk mode starts its queue
+    with a ``[data-bulk-start]`` button that only appears once a row has
+    validated against the site, so it needs a real wait - and its hidden
+    single-mode counterpart must never be clicked.
+    """
+    try:
+        if not page.locator("form.cpost-form").first.is_visible(
+            timeout=SAFE_READ_TIMEOUT_MS
+        ):
+            page.locator("[data-bulk-start]").first.wait_for(
+                state="visible", timeout=10000
+            )
+    except Exception:
+        pass
+    submit_btn = _first_visible_locator(page, SUBMIT_BUTTON_SELECTORS)
+    if submit_btn is None:
+        submit_btn = page.locator(
+            "button[type='submit'], button:has-text('Submit upload')"
+        ).first
+    return submit_btn
 
 
 def upload_single_chapter(
@@ -2082,42 +2316,27 @@ def upload_single_chapter(
     # before the form wait (which would otherwise read as "origin is down").
     _raise_if_access_blocked(page)
 
-    try:
-        page.wait_for_selector(".upage-field input", timeout=15000)
-    except Exception as ex:
-        kind = detect_challenge(page)
-        if kind:
-            raise _exception_for(
-                kind, "A verification screen blocked the upload form."
-            ) from ex
-        _raise_if_access_blocked(page)
-        raise
+    _wait_for_upload_form(page)
+    _prefer_single_chapter_form(page)
 
-    page.wait_for_timeout(500)
+    # Dismiss any open dropdown without clicking page chrome: a positional
+    # click at the corner can hit the site nav on the redesigned layout.
     try:
-        page.locator("body").click(position={"x": 5, "y": 5}, force=True, timeout=2000)
-        page.wait_for_timeout(1000)
+        _bounded_eval(
+            page,
+            "() => document.body.dispatchEvent("
+            "new MouseEvent('mousedown', {bubbles: true}))",
+        )
     except Exception:
         pass
     if control is not None and control.raise_window:
         page.bring_to_front()
 
-    chapter_input = page.locator(
-        ".upage-field input[placeholder*='42'], input[placeholder*='42']"
-    ).first
-    title_input = page.locator(
-        ".upage-field input[placeholder*='Walk Home'], input[placeholder*='Walk Home']"
-    ).first
-    file_input = page.locator(FILE_INPUT_SELECTOR).first
-    official_checkbox = page.locator("input[type='checkbox']").first
-    submit_btn = page.locator(
-        "button[type='submit'], button:has-text('Submit upload')"
-    ).first
+    file_input, file_selector = _resolve_file_input(page)
+    official_checkbox = page.locator(OFFICIAL_TOGGLE_SELECTOR).first
 
-    chapter_input.fill(str(chapter_num))
-    if title:
-        title_input.fill(title)
-
+    # Group and official first: in bulk mode both lock once a file is added,
+    # and in single mode the order does not matter.
     _fill_group(
         page, group_name, log, allow_raise=bool(control and control.raise_window)
     )
@@ -2131,41 +2350,27 @@ def upload_single_chapter(
     except Exception:
         pass
 
-    attach_upload_file(page, file_input, file_path, log)
+    # Attach before filling the chapter fields: in bulk mode the per-file row
+    # and its inputs only exist once a file has been added.
+    attach_upload_file(page, file_input, file_path, log, file_selector)
     page.wait_for_timeout(1500)
 
-    tracker = {
-        "finalized": False,
-        "error": None,
-        "blocked": False,
-        "server_down": False,
-        "last_activity": time.time(),
-        "chunks_done": 0,
-        "retry_after": None,
-    }
+    chapter_input = _first_visible_locator(page, CHAPTER_INPUT_SELECTORS)
+    if chapter_input is None:
+        raise RuntimeError(
+            "The chapter number field did not appear on the upload form."
+        )
+    chapter_input.fill(str(chapter_num))
+    if title:
+        title_input = _first_visible_locator(page, TITLE_INPUT_SELECTORS)
+        if title_input is None:
+            log("[!] Warning: chapter title field not found - uploading without it.")
+        else:
+            title_input.fill(title)
 
-    def on_response(res):
-        res_url = res.url
-        if "/upload/chunk" in res_url and res.status == 200:
-            tracker["last_activity"] = time.time()
-            tracker["chunks_done"] += 1
-            if on_chunk:
-                on_chunk(tracker["chunks_done"])
-        elif "/api/v1/uploads" in res_url:
-            tracker["last_activity"] = time.time()
-            if "finalize" in res_url and res.status == 200:
-                tracker["finalized"] = True
-            elif res.status in (403, 503):
-                tracker["blocked"] = True
-                tracker["error"] = f"Upload API blocked (HTTP {res.status})"
-            elif res.status in (500, 502, 503, 504):
-                # Origin failing, not the account: flag server-down, not challenge.
-                tracker["server_down"] = True
-                tracker["error"] = f"HTTP {res.status} on {res_url}"
-            elif res.status == 429:
-                tracker["error"] = f"HTTP {res.status} on {res_url}"
-                # Remember Retry-After so the retry backs off deliberately.
-                tracker["retry_after"] = _retry_after_seconds(res)
+    submit_btn = _resolve_submit_button(page)
+
+    tracker, on_response = _make_response_tracker(on_chunk)
 
     page.on("response", on_response)
 
@@ -2199,6 +2404,32 @@ def upload_single_chapter(
                 )
                 return True, None
 
+            # The form's own progress element carries the upload engine's
+            # state. "done" is proof even when the finalize response was a
+            # redirect the tracker never saw; "failed" fails fast instead of
+            # waiting out the whole idle timeout.
+            try:
+                phase = (
+                    page.locator(".upage__progress[data-phase] >> visible=true")
+                    .first.get_attribute("data-phase", timeout=SAFE_READ_TIMEOUT_MS)
+                )
+            except Exception:
+                phase = None
+            if phase == "done":
+                log(
+                    f"[✓] Chapter {chapter_num:g} uploaded "
+                    f"({tracker['chunks_done']} chunks)."
+                )
+                return True, None
+            if phase == "failed":
+                err = (
+                    tracker.get("error")
+                    or _upload_failure_text(page)
+                    or "The upload form reported a failure."
+                )
+                log(f"[!] {err}")
+                return False, err
+
             if tracker.get("blocked"):
                 # 403/503 is ambiguous; let the DOM decide before pausing.
                 if _confirm_block(page):
@@ -2231,8 +2462,11 @@ def upload_single_chapter(
                 log(f"[!] Server error: {tracker['error']}")
                 return False, tracker["error"]
 
+            # Only real error toasts: the redesigned page also uses
+            # role="alert" for informational notes (the resume-mismatch
+            # warning), which must not fail a healthy upload.
             error_el = page.locator(
-                ".alert-danger, .error-message, .toast-error, div[role='alert']"
+                ".toast--error, .alert-danger, .error-message, .toast-error"
             ).first
             try:
                 if error_el.is_visible(timeout=SAFE_READ_TIMEOUT_MS):
